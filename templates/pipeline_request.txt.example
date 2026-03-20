@@ -1,0 +1,11 @@
+pipeline_name: example-service-ai-pipeline
+environment: production
+target: aws_ec2
+instance_type: t3.micro
+ami: latest-ubuntu
+deploy_using: docker-compose
+frontend_port: 3000
+backend_port: 8000
+labels: [ai-generated, devops-agent, example-service]
+email_notification: false
+email_recipient: platform@example.com

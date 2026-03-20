@@ -1,0 +1,275 @@
+name: AI DevOps Agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Agent execution mode
+        required: true
+        default: suggest-changes
+        type: choice
+        options:
+          - analyze-only
+          - suggest-changes
+          - generate-pipeline
+          - apply-fixes
+      create_pull_request:
+        description: Create a pull request when generated files change
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ai-devops-agent-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+  DEVOPS_AGENT_SOURCE_REPO: aravinthnalls/DevOpsAgent
+  DEVOPS_AGENT_REF: main
+  AGENT_REPO_PATH: .github/tools/devops-agent-source
+  AGENT_PATH: .github/tools/devops-agent-source/ai_devops_agent.py
+
+jobs:
+  analyze-and-comment:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout AI DevOps Agent source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEVOPS_AGENT_SOURCE_REPO }}
+          ref: ${{ env.DEVOPS_AGENT_REF }}
+          path: ${{ env.AGENT_REPO_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pyyaml
+
+      - name: Run AI analysis
+        env:
+          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
+        run: |
+          python "$AGENT_PATH" \
+            --project-root . \
+            --config-file pipeline_request.txt \
+            --analyze-only \
+            --verbose \
+            > ai-devops-agent-output.txt 2>&1 || true
+
+      - name: Generate suggestions report
+        env:
+          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
+        run: |
+          python "$AGENT_PATH" \
+            --project-root . \
+            --config-file pipeline_request.txt \
+            --suggest-changes \
+            > suggestions-output.txt 2>&1 || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-devops-agent-pr-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ai-devops-agent-output.txt
+            suggestions-output.txt
+            suggestions.md
+
+      - name: Comment on pull request
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          if [[ -f suggestions.md ]]; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file suggestions.md
+          elif [[ -f ai-devops-agent-output.txt ]]; then
+            {
+              echo "## AI DevOps Agent"
+              echo
+              echo '```text'
+              tail -n 200 ai-devops-agent-output.txt
+              echo '```'
+            } > pr-comment.md
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file pr-comment.md
+          fi
+
+  manual-run:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout AI DevOps Agent source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEVOPS_AGENT_SOURCE_REPO }}
+          ref: ${{ env.DEVOPS_AGENT_REF }}
+          path: ${{ env.AGENT_REPO_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pyyaml
+
+      - name: Resolve mode
+        id: mode
+        run: |
+          MODE="${{ inputs.mode }}"
+          case "$MODE" in
+            analyze-only)
+              echo "args=--analyze-only --verbose" >> "$GITHUB_OUTPUT"
+              ;;
+            suggest-changes)
+              echo "args=--suggest-changes" >> "$GITHUB_OUTPUT"
+              ;;
+            generate-pipeline)
+              echo "args=" >> "$GITHUB_OUTPUT"
+              ;;
+            apply-fixes)
+              echo "args=--apply-fixes" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unsupported mode: $MODE" >&2
+              exit 1
+              ;;
+          esac
+          echo "selected_mode=$MODE" >> "$GITHUB_OUTPUT"
+
+      - name: Run selected mode
+        env:
+          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
+        run: |
+          python "$AGENT_PATH" \
+            --project-root . \
+            --config-file pipeline_request.txt \
+            ${{ steps.mode.outputs.args }} \
+            > ai-devops-agent-output.txt 2>&1 || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-devops-agent-manual-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ai-devops-agent-output.txt
+            suggestions.md
+            README.md
+            VERSION
+            .github/workflows/ci-cd.yml
+            .github/workflows/ai-generate-workflow.yml
+            terraform/**
+            docker-compose.yml
+            frontend/Dockerfile
+            backend/Dockerfile
+
+      - name: Create pull request with generated changes
+        if: steps.mode.outputs.selected_mode == 'generate-pipeline' && inputs.create_pull_request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/ai-devops-agent-${{ github.run_id }}
+          commit-message: 'chore: apply AI DevOps agent outputs'
+          title: 'chore: apply AI DevOps agent outputs'
+          body: |
+            This pull request was created by the AI DevOps Agent workflow.
+
+            - Mode: `${{ steps.mode.outputs.selected_mode }}`
+            - Source: `${{ env.DEVOPS_AGENT_SOURCE_REPO }}@${{ env.DEVOPS_AGENT_REF }}`
+
+            Review generated workflows, Terraform, Dockerfiles, and README changes before merge.
+
+  create-fix-pr:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Checkout AI DevOps Agent source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEVOPS_AGENT_SOURCE_REPO }}
+          ref: ${{ env.DEVOPS_AGENT_REF }}
+          path: ${{ env.AGENT_REPO_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pyyaml
+
+      - name: Run full generation
+        env:
+          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
+        run: |
+          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt > ai-devops-agent-output.txt 2>&1 || true
+
+      - name: Generate suggestions
+        env:
+          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
+        run: |
+          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt --suggest-changes >> ai-devops-agent-output.txt 2>&1 || true
+
+      - name: Apply fixes
+        env:
+          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
+        run: |
+          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt --apply-fixes >> ai-devops-agent-output.txt 2>&1 || true
+
+      - name: Create pull request with fix changes
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          branch: ai-suggestions-${{ github.run_id }}
+          commit-message: 'AI: Post-merge pipeline updates'
+          title: '🤖 AI Suggestions: Post-merge fixes'
+          body-path: suggestions.md
+
+      - name: Upload post-merge artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-devops-agent-post-merge-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ai-devops-agent-output.txt
+            suggestions.md
+            README.md
+            VERSION
+            .github/workflows/ci-cd.yml
+            .github/workflows/ai-generate-workflow.yml
+            terraform/**
+            docker-compose.yml
+            frontend/Dockerfile
+            backend/Dockerfile
