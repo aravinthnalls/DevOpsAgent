@@ -1,103 +1,144 @@
 # AI DevOps Agent Implementation Guide
 
-This guide explains how to implement the agent from this repository in another repository with the same pull-request analysis and post-merge fix PR pattern described by the agent design.
+**Simplified Version** — All workflow logic is now in Python!
 
-## Adoption model
+This guide explains how to use the streamlined agent. The implementation is straightforward: a Python script with workflow orchestration modes instead of complex GitHub Actions templates.
 
-Recommended model:
+## Architecture Overview
 
-1. keep this repository as the source of truth
-2. check out this repository during workflow execution into a tools path
-3. run it against the checked-out target repository
-4. publish `suggestions.md` on pull requests
-5. after merge, run generation and open a fix PR automatically
+The agent is organized into clear, focused Python components:
 
-That flow is implemented in [templates/github-actions/ai-devops-agent-template.yml](../templates/github-actions/ai-devops-agent-template.yml).
+- **ProjectAnalyzer** - Analyzes project structure, frameworks, and security
+- **PipelineGenerator** - Generates CI/CD files and infrastructure code  
+- **WorkflowOrchestrator** - Manages execution modes (analyze, generate, suggest, etc.)
+
+All workflow logic runs in Python - no complex GitHub Actions orchestration needed.
 
 ## Target repository expectations
 
 Best results come from repositories with:
 
-- `frontend/` for frontend application code
-- `backend/` for Python backend code
-- `pipeline_request.txt` for generation settings
+- `frontend/` for frontend application code (Node.js, React, Vue, etc.)
+- `backend/` for Python backend code (FastAPI, Flask, Django, etc.)  
+- `pipeline_request.txt` for generation settings (optional)
 
-If the structure differs, analysis and generated outputs may need manual adjustment.
+## Installation
 
-## Mandatory runtime requirement
+Copy `ai_devops_agent.py` to your repository or reference it from this source repository.
 
-The agent requires an OpenAI token on every execution path.
+### Requirements
 
-Supported injection methods:
-
-- `--openai-token`
-- `OPENAI_API_TOKEN`
-
-Without one, the agent exits immediately.
-
-## Source code reference model
-
-The workflow template does not download a raw Python file.
-
-Instead, it checks out this repository as a second working tree inside the target repository workflow run and executes [ai_devops_agent.py](../ai_devops_agent.py) from that checked-out path.
-
-Default layout inside the workflow runner:
-
-```text
-.
-├── <target repository>
-└── .github/tools/devops-agent-source/
-	└── ai_devops_agent.py
+```bash
+python -m pip install -r requirements.txt
+# Optional: install development tooling
+python -m pip install -r requirements-dev.txt
+python >= 3.9
 ```
 
-This makes the implementation easier to audit and lets you pin the full source repository by branch, tag, or commit SHA.
+## Usage
 
 ## Required secrets in the target repository
 
 | Secret | Purpose | Required |
 |---|---|---|
-| `OPENAI_API_TOKEN` | AI enrichment and recommendations | Mandatory |
-| `PAT_TOKEN` | Create comments, branches, and fix PRs | Mandatory |
-| `AWS_ACCESS_KEY_ID` | Terraform deployment workflow output | Mandatory |
-| `AWS_SECRET_ACCESS_KEY` | Terraform deployment workflow output | Mandatory |
-| `EMAIL_USERNAME` | Deployment notifications | Optional |
-| `EMAIL_PASSWORD` | Deployment notifications | Optional |
+| `OPENAI_API_TOKEN` | AI enrichment (future use) | Optional |
 
-## Files to copy into the target repository
+## Execution Modes
 
-### Workflow template
+The agent supports multiple execution modes:
 
-Copy [templates/github-actions/ai-devops-agent-template.yml](../templates/github-actions/ai-devops-agent-template.yml) to `.github/workflows/ai-devops-agent.yml`.
+### 1. Analyze Only
+Scan the project and display findings:
+```bash
+python ai_devops_agent.py --mode analyze-only
+```
 
-### Pipeline configuration
+### 2. Generate Pipeline (Default)
+Generate all CI/CD and infrastructure files:
+```bash
+python ai_devops_agent.py
+# or
+python ai_devops_agent.py --mode generate
+```
 
-Copy [templates/pipeline_request.txt.example](../templates/pipeline_request.txt.example) to `pipeline_request.txt`.
+### 3. Generate and Commit
+Generate files and automatically commit:
+```bash
+python ai_devops_agent.py --mode generate-and-commit
+```
 
-Suggested starting point:
+### 4. Suggest Changes
+Create a suggestions report:
+```bash
+python ai_devops_agent.py --mode suggest-changes
+```
 
-```text
-pipeline_name: my-service-ai-pipeline
+## Configuration
+
+Create `pipeline_request.txt` in your project root:
+
+```yaml
+pipeline_name: my-service-pipeline
 environment: production
 target: aws_ec2
 instance_type: t3.micro
-ami: latest-ubuntu
-deploy_using: docker-compose
 frontend_port: 3000
 backend_port: 8000
-labels: [ai-generated, devops-agent]
-email_notification: false
-email_recipient: platform@example.com
 ```
 
-## Workflow behavior
+## What Gets Generated
 
-### Pull request path
+The agent creates:
 
-On pull request open or update, the workflow:
+1. **`.github/workflows/pipeline.yml`** - Ready-to-use CI/CD pipeline
+   - Installs dependencies
+   - Runs tests  
+   - Builds Docker image
+   - Deploys to AWS
 
-- checks out the PR branch
-- checks out this repository into `.github/tools/devops-agent-source`
-- installs `requests` and `PyYAML`
+2. **`docker-compose.yml`** - Local development environment
+   - Spins up frontend + backend services
+   - Configures networking and ports
+
+3. **`terraform/`** - Infrastructure as Code
+   - AWS EC2 instance configuration
+   - Security groups
+   - Auto-detection of Ubuntu AMI
+
+4. **`README_GENERATED.md`** - Documentation
+   - Project overview
+   - Quick start instructions
+   - Security findings
+   - Deployment steps
+
+## Workflow Benefits
+
+✅ **Simple** - Single Python file, no complex orchestration
+✅ **Fast** - Generates complete pipelines in seconds
+✅ **Modular** - Easy to extend or customize
+✅ **Type-safe** - Python type hints throughout
+✅ **Flexible** - Run locally or in any CI/CD system
+
+## Integration Examples
+
+### Run locally
+```bash
+python ai_devops_agent.py --project-root /path/to/project
+```
+
+### Use in GitHub Actions
+```yaml
+- name: Run AI DevOps Agent
+  run: python ai_devops_agent.py --mode generate-and-commit
+```
+
+### Use in GitLab CI
+```yaml
+ai_devops_agent:
+  script:
+    - pip install -q pyyaml requests
+    - python ai_devops_agent.py --mode suggest-changes
+```
 - runs `python ai_devops_agent.py --analyze-only`
 - runs `python ai_devops_agent.py --suggest-changes`
 - uploads artifacts

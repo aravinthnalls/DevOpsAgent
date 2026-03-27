@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+
+# macOS / editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Logs and runtime files
+*.log
+*.out
+*.pid
+
+# Generated agent outputs
+ai-devops-agent-output.txt
+suggestions-output.txt
+SUGGESTIONS.md
+README_GENERATED.md
+
+# Local backup files
+*.old

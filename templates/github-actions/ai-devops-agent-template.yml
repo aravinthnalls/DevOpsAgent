@@ -13,8 +13,8 @@ on:
         options:
           - analyze-only
           - suggest-changes
-          - generate-pipeline
-          - apply-fixes
+          - generate
+          - generate-and-commit
       create_pull_request:
         description: Create a pull request when generated files change
         required: true
@@ -63,24 +63,20 @@ jobs:
           python -m pip install requests pyyaml
 
       - name: Run AI analysis
-        env:
-          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
         run: |
           python "$AGENT_PATH" \
             --project-root . \
             --config-file pipeline_request.txt \
-            --analyze-only \
+            --mode analyze-only \
             --verbose \
             > ai-devops-agent-output.txt 2>&1 || true
 
       - name: Generate suggestions report
-        env:
-          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
         run: |
           python "$AGENT_PATH" \
             --project-root . \
             --config-file pipeline_request.txt \
-            --suggest-changes \
+            --mode suggest-changes \
             > suggestions-output.txt 2>&1 || true
 
       - name: Upload artifacts
@@ -91,14 +87,14 @@ jobs:
           path: |
             ai-devops-agent-output.txt
             suggestions-output.txt
-            suggestions.md
+            SUGGESTIONS.md
 
       - name: Comment on pull request
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          if [[ -f suggestions.md ]]; then
-            gh pr comment "${{ github.event.pull_request.number }}" --body-file suggestions.md
+          if [[ -f SUGGESTIONS.md ]]; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file SUGGESTIONS.md
           elif [[ -f ai-devops-agent-output.txt ]]; then
             {
               echo "## AI DevOps Agent"
@@ -141,16 +137,16 @@ jobs:
           MODE="${{ inputs.mode }}"
           case "$MODE" in
             analyze-only)
-              echo "args=--analyze-only --verbose" >> "$GITHUB_OUTPUT"
+              echo "args=--mode analyze-only --verbose" >> "$GITHUB_OUTPUT"
               ;;
             suggest-changes)
-              echo "args=--suggest-changes" >> "$GITHUB_OUTPUT"
+              echo "args=--mode suggest-changes" >> "$GITHUB_OUTPUT"
               ;;
-            generate-pipeline)
-              echo "args=" >> "$GITHUB_OUTPUT"
+            generate)
+              echo "args=--mode generate" >> "$GITHUB_OUTPUT"
               ;;
-            apply-fixes)
-              echo "args=--apply-fixes" >> "$GITHUB_OUTPUT"
+            generate-and-commit)
+              echo "args=--mode generate-and-commit" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "Unsupported mode: $MODE" >&2
@@ -160,8 +156,6 @@ jobs:
           echo "selected_mode=$MODE" >> "$GITHUB_OUTPUT"
 
       - name: Run selected mode
-        env:
-          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
         run: |
           python "$AGENT_PATH" \
             --project-root . \
@@ -176,18 +170,15 @@ jobs:
           if-no-files-found: ignore
           path: |
             ai-devops-agent-output.txt
-            suggestions.md
-            README.md
-            VERSION
-            .github/workflows/ci-cd.yml
-            .github/workflows/ai-generate-workflow.yml
+            SUGGESTIONS.md
+            README_GENERATED.md
+            .github/workflows/pipeline.yml
             terraform/**
             docker-compose.yml
-            frontend/Dockerfile
-            backend/Dockerfile
+            .github/workflows/*.yml
 
       - name: Create pull request with generated changes
-        if: steps.mode.outputs.selected_mode == 'generate-pipeline' && inputs.create_pull_request
+        if: (steps.mode.outputs.selected_mode == 'generate' || steps.mode.outputs.selected_mode == 'generate-and-commit') && inputs.create_pull_request
         uses: peter-evans/create-pull-request@v7
         with:
           branch: chore/ai-devops-agent-${{ github.run_id }}
@@ -231,22 +222,12 @@ jobs:
           python -m pip install requests pyyaml
 
       - name: Run full generation
-        env:
-          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
         run: |
-          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt > ai-devops-agent-output.txt 2>&1 || true
+          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt --mode generate > ai-devops-agent-output.txt 2>&1 || true
 
       - name: Generate suggestions
-        env:
-          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
         run: |
-          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt --suggest-changes >> ai-devops-agent-output.txt 2>&1 || true
-
-      - name: Apply fixes
-        env:
-          OPENAI_API_TOKEN: ${{ secrets.OPENAI_API_TOKEN }}
-        run: |
-          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt --apply-fixes >> ai-devops-agent-output.txt 2>&1 || true
+          python "$AGENT_PATH" --project-root . --config-file pipeline_request.txt --mode suggest-changes >> ai-devops-agent-output.txt 2>&1 || true
 
       - name: Create pull request with fix changes
         uses: peter-evans/create-pull-request@v7
@@ -255,7 +236,7 @@ jobs:
           branch: ai-suggestions-${{ github.run_id }}
           commit-message: 'AI: Post-merge pipeline updates'
           title: '🤖 AI Suggestions: Post-merge fixes'
-          body-path: suggestions.md
+          body-path: SUGGESTIONS.md
 
       - name: Upload post-merge artifacts
         uses: actions/upload-artifact@v4
@@ -264,12 +245,9 @@ jobs:
           if-no-files-found: ignore
           path: |
             ai-devops-agent-output.txt
-            suggestions.md
-            README.md
-            VERSION
-            .github/workflows/ci-cd.yml
-            .github/workflows/ai-generate-workflow.yml
+            SUGGESTIONS.md
+            README_GENERATED.md
+            .github/workflows/pipeline.yml
             terraform/**
             docker-compose.yml
-            frontend/Dockerfile
-            backend/Dockerfile
+            .github/workflows/*.yml
