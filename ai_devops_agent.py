@@ -482,56 +482,89 @@ class ProjectAnalyzer:
     def _analyze_github_actions(self) -> Dict:
         workflow_dir = self.project_root / ".github" / "workflows"
         if not workflow_dir.exists():
-            return {"exists": False, "workflows": [], "issues": []}
+            return {
+                "exists": False,
+                "workflows": [],
+                "issues": [],
+                "ci_cd_workflows": [],
+                "helper_workflows": [],
+                "ci_cd_present": False,
+            }
 
         workflows: List[Dict] = []
         issues: List[Dict] = []
+        ci_cd_workflows: List[str] = []
+        helper_workflows: List[str] = []
 
         for workflow_file in sorted(workflow_dir.glob("*.y*ml")):
             content = self._safe_read_text(workflow_file)
+            rel_file = self._relative(workflow_file)
+            is_agent_workflow = "ai-devops-agent" in workflow_file.name
+            is_ci_cd_workflow = self._looks_like_ci_cd_workflow(workflow_file, content) and not is_agent_workflow
             workflow = {
-                "file": self._relative(workflow_file),
+                "file": rel_file,
                 "uses_checkout": "actions/checkout@" in content,
                 "uses_setup_python": "actions/setup-python@" in content,
                 "uses_setup_node": "actions/setup-node@" in content,
                 "runs_tests": bool(re.search(r"\b(pytest|npm test|pnpm test|yarn test|mvn test|go test)\b", content)),
                 "uploads_artifacts": "actions/upload-artifact@" in content,
                 "create_pull_request": "create-pull-request@" in content,
+                "is_agent_workflow": is_agent_workflow,
+                "is_ci_cd_workflow": is_ci_cd_workflow,
             }
             workflows.append(workflow)
+            if is_agent_workflow:
+                helper_workflows.append(rel_file)
+            if is_ci_cd_workflow:
+                ci_cd_workflows.append(rel_file)
 
-            if "ai-devops-agent" in workflow_file.name:
+            if is_agent_workflow:
                 if "--apply-fixes" in content:
                     issues.append({
                         "severity": "HIGH",
-                        "file": self._relative(workflow_file),
+                        "file": rel_file,
                         "issue": "Workflow calls unsupported --apply-fixes flag.",
                         "fix": "Run the agent only with --mode ai.",
                     })
                 if "suggestions.md" in content and "SUGGESTIONS.md" not in content:
                     issues.append({
                         "severity": "MEDIUM",
-                        "file": self._relative(workflow_file),
+                        "file": rel_file,
                         "issue": "Workflow expects suggestions.md but the agent now writes AI_DEVOPS_REPORT.md.",
                         "fix": "Update artifact and PR comment steps to use AI_DEVOPS_REPORT.md.",
                     })
                 if "generate-pipeline" in content or "suggest-changes" in content or "generate-and-commit" in content or "analyze-only" in content:
                     issues.append({
                         "severity": "MEDIUM",
-                        "file": self._relative(workflow_file),
+                        "file": rel_file,
                         "issue": "Workflow references legacy execution modes.",
                         "fix": "Replace legacy execution modes with the single supported ai mode.",
                     })
 
-            if not workflow["runs_tests"]:
+            if is_ci_cd_workflow and not workflow["runs_tests"]:
                 issues.append({
                     "severity": "MEDIUM",
-                    "file": self._relative(workflow_file),
+                    "file": rel_file,
                     "issue": "Workflow does not appear to run application tests.",
                     "fix": "Add test commands for the detected frontend/backend stack.",
                 })
 
-        return {"exists": True, "workflows": workflows, "issues": issues}
+        if not ci_cd_workflows:
+            issues.append({
+                "severity": "MEDIUM",
+                "file": ".github/workflows",
+                "issue": "No CI/CD implementation workflow is present; the AI DevOps Agent workflow is not counted as CI/CD.",
+                "fix": "Add an application CI/CD workflow for build, test, and deployment stages.",
+            })
+
+        return {
+            "exists": True,
+            "workflows": workflows,
+            "issues": issues,
+            "ci_cd_workflows": ci_cd_workflows,
+            "helper_workflows": helper_workflows,
+            "ci_cd_present": bool(ci_cd_workflows),
+        }
 
     def _analyze_security(self, frontend: Dict, backend: Dict, infrastructure: Dict) -> Dict:
         issues = {"frontend": [], "backend": [], "infrastructure": [], "github_actions": []}
@@ -709,8 +742,10 @@ class ProjectAnalyzer:
                 )
         if infrastructure.get("terraform_exists"):
             strengths.append("Repository already contains Terraform configuration.")
-        if github_actions.get("exists"):
-            strengths.append("Repository already contains GitHub Actions workflows.")
+        if github_actions.get("helper_workflows"):
+            strengths.append("Repository contains GitHub Actions helper or analysis workflows.")
+        if github_actions.get("ci_cd_present"):
+            strengths.append("Repository already contains CI/CD workflows for the application.")
         if infrastructure.get("compose_services"):
             strengths.append(
                 f"Docker Compose services detected: {', '.join(infrastructure['compose_services'])}."
@@ -727,6 +762,9 @@ class ProjectAnalyzer:
         if github_actions.get("exists") and github_actions.get("issues"):
             gaps.append("Existing GitHub Actions workflows contain drift against current agent capabilities.")
             suggestions.append("Align workflow inputs, filenames, and supported CLI modes with the current agent.")
+        if github_actions.get("exists") and not github_actions.get("ci_cd_present"):
+            gaps.append("No application CI/CD implementation workflow was detected.")
+            suggestions.append("Add a separate CI/CD workflow for build, test, and deployment; do not rely on the agent workflow as the app pipeline.")
         if backend.get("exists") and backend.get("language") == "python":
             backend_path = self.project_root / backend["path"]
             if not any((backend_path / name).exists() for name in ("requirements.txt", "pyproject.toml")):
@@ -956,6 +994,26 @@ class ProjectAnalyzer:
                 if name != "services" and name not in services:
                     services.append(name)
         return services
+
+    def _looks_like_ci_cd_workflow(self, workflow_file: Path, content: str) -> bool:
+        filename = workflow_file.name.lower()
+        if "ai-devops-agent" in filename:
+            return False
+        ci_cd_name_markers = ("ci", "cd", "deploy", "release", "build", "pipeline", "test")
+        ci_cd_step_markers = (
+            "docker build",
+            "terraform ",
+            "kubectl ",
+            "helm ",
+            "npm test",
+            "pytest",
+            "mvn test",
+            "gradlew test",
+            "go test",
+        )
+        if any(marker in filename for marker in ci_cd_name_markers):
+            return True
+        return any(marker in content.lower() for marker in ci_cd_step_markers)
 
     def _detect_go_framework(self, backend_path: Path) -> str:
         for file in backend_path.rglob("*.go"):
@@ -1651,6 +1709,8 @@ OpenAI model: `{ai_insights.get('model', 'unknown')}`
 ## Workflow Review
 
 - Workflows found: {len(workflows.get('workflows', []))}
+- CI/CD workflows found: {len(workflows.get('ci_cd_workflows', []))}
+- Helper workflows found: {len(workflows.get('helper_workflows', []))}
 {self._format_issue_lines(workflows.get('issues', []), 'No workflow issues auto-detected.')}
 
 ### AI Workflow Review
@@ -1799,6 +1859,8 @@ OpenAI model: `{ai_insights.get('model', 'unknown')}`
         print(f"- Kubernetes manifests: {len(analysis['infrastructure'].get('kubernetes_files', []))}")
         print(f"- Docker Compose services: {', '.join(analysis['infrastructure'].get('compose_services', [])) or 'none'}")
         print(f"- GitHub Actions workflows: {len(analysis['github_actions'].get('workflows', []))}")
+        print(f"- CI/CD workflows: {len(analysis['github_actions'].get('ci_cd_workflows', []))}")
+        print(f"- Helper workflows: {len(analysis['github_actions'].get('helper_workflows', []))}")
         print(f"\nAI model: {ai_insights.get('model', 'unknown')}")
         print(f"AI summary: {ai_insights.get('executive_summary', 'No AI summary generated.')}")
 
