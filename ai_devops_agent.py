@@ -1220,6 +1220,7 @@ class PipelineGenerator:
 
         frontend = analysis["frontend"]
         backend = analysis["backend"]
+        target = self.config.get("target", "aws_ec2")
         frontend_setup = ""
         backend_setup = ""
         frontend_steps = ""
@@ -1310,6 +1311,41 @@ class PipelineGenerator:
         run: docker build -t app:latest .
 """
 
+        deploy_env = ""
+        deploy_setup = ""
+        deploy_steps = f"""      - name: Skip cloud deployment
+        run: echo "Cloud target {target} requires environment-specific setup; skipping automated deploy."
+"""
+        if target == "aws_ec2":
+            deploy_env = """    env:
+      CLOUD_DEPLOY_ENABLED: ${{ secrets.AWS_ACCESS_KEY_ID != '' && secrets.AWS_SECRET_ACCESS_KEY != '' && vars.AWS_REGION != '' }}
+"""
+            deploy_setup = """      - name: Configure AWS credentials
+        if: env.CLOUD_DEPLOY_ENABLED == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Set up Terraform
+        if: env.CLOUD_DEPLOY_ENABLED == 'true'
+        uses: hashicorp/setup-terraform@v3
+"""
+            deploy_steps = """      - name: Terraform apply
+        if: env.CLOUD_DEPLOY_ENABLED == 'true'
+        working-directory: terraform
+        run: |
+          terraform init
+          terraform validate
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+
+      - name: Skip cloud deployment
+        if: env.CLOUD_DEPLOY_ENABLED != 'true'
+        run: echo "AWS credentials or AWS region are not configured; skipping Terraform apply."
+"""
+
         workflow = f"""name: CI/CD Pipeline
 
 on:
@@ -1333,12 +1369,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: validate
     runs-on: ubuntu-latest
-    steps:
+{deploy_env}    steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Deployment placeholder
-        run: echo "Deploy to {self.config.get('target', 'aws_ec2')} here"
+{deploy_setup}{deploy_steps}
 """
         workflow_file = workflow_dir / "pipeline.yml"
         workflow_file.write_text(workflow, encoding="utf-8")
@@ -1365,39 +1400,176 @@ jobs:
     def _generate_docker_compose(self, analysis: Dict) -> None:
         frontend = analysis["frontend"]
         backend = analysis["backend"]
-        lines = ["version: '3.9'", "services:"]
+        datastores = backend.get("datastores", [])
+        compose: Dict[str, object] = {
+            "version": "3.9",
+            "services": {},
+            "volumes": {},
+        }
 
         if frontend.get("exists") and frontend.get("type") != "spring-static":
-            lines.extend([
-                "  frontend:",
-                f"    build: ./{frontend['path']}",
-                "    ports:",
-                f"      - '{frontend.get('port', 3000)}:3000'",
-                "    environment:",
-                "      NODE_ENV: production",
-            ])
+            compose["services"]["frontend"] = {
+                "build": f"./{frontend['path']}",
+                "ports": [f"{frontend.get('port', 3000)}:3000"],
+                "environment": {"NODE_ENV": "production"},
+                "restart": "unless-stopped",
+            }
 
         if backend.get("exists"):
             internal_port = backend.get("port", 8080 if backend.get("language") == "java" else 8000)
-            lines.extend([
-                "  backend:",
-                f"    build: ./{backend['path']}",
-                "    ports:",
-                f"      - '{internal_port}:{internal_port}'",
-                "    environment:",
-                "      APP_ENV: production",
-                "      DEBUG: 'false'",
-            ])
+            preferred_datastore = self.config.get("database_engine", "").strip().lower()
+            if preferred_datastore not in datastores:
+                preferred_datastore = datastores[0] if datastores else ""
+            backend_service: Dict[str, object] = {
+                "build": f"./{backend['path']}",
+                "ports": [f"{internal_port}:{internal_port}"],
+                "environment": {
+                    "APP_ENV": "production",
+                    "DEBUG": "false",
+                },
+                "restart": "unless-stopped",
+                "healthcheck": {
+                    "test": ["CMD-SHELL", f"curl -fsS http://localhost:{internal_port}/ || exit 1"],
+                    "interval": "30s",
+                    "timeout": "10s",
+                    "retries": 5,
+                    "start_period": "30s",
+                },
+            }
+            depends_on: Dict[str, Dict[str, str]] = {}
+            if "mysql" in datastores:
+                depends_on["mysql"] = {"condition": "service_healthy"}
+            if "postgres" in datastores:
+                depends_on["postgres"] = {"condition": "service_healthy"}
+            if preferred_datastore == "mysql":
+                backend_service["environment"]["DB_HOST"] = "mysql"
+                backend_service["environment"]["DB_PORT"] = "3306"
+            elif preferred_datastore == "postgres":
+                backend_service["environment"]["DB_HOST"] = "postgres"
+                backend_service["environment"]["DB_PORT"] = "5432"
+            if depends_on:
+                backend_service["depends_on"] = depends_on
+            compose["services"]["backend"] = backend_service
 
+        if "mysql" in datastores:
+            compose["services"]["mysql"] = {
+                "image": "mysql:8.4",
+                "restart": "unless-stopped",
+                "ports": ["3306:3306"],
+                "environment": {
+                    "MYSQL_DATABASE": "appdb",
+                    "MYSQL_USER": "appuser",
+                    "MYSQL_PASSWORD": "change-me",
+                    "MYSQL_ROOT_PASSWORD": "change-me-root",
+                },
+                "volumes": [
+                    "mysql_data:/var/lib/mysql",
+                    "./docker/init/mysql:/docker-entrypoint-initdb.d:ro",
+                ],
+                "healthcheck": {
+                    "test": ["CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD"],
+                    "interval": "10s",
+                    "timeout": "5s",
+                    "retries": 10,
+                },
+            }
+            compose["volumes"]["mysql_data"] = {}
+
+        if "postgres" in datastores:
+            compose["services"]["postgres"] = {
+                "image": "postgres:16",
+                "restart": "unless-stopped",
+                "ports": ["5432:5432"],
+                "environment": {
+                    "POSTGRES_DB": "appdb",
+                    "POSTGRES_USER": "appuser",
+                    "POSTGRES_PASSWORD": "change-me",
+                },
+                "volumes": [
+                    "postgres_data:/var/lib/postgresql/data",
+                    "./docker/init/postgres:/docker-entrypoint-initdb.d:ro",
+                ],
+                "healthcheck": {
+                    "test": ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"],
+                    "interval": "10s",
+                    "timeout": "5s",
+                    "retries": 10,
+                },
+            }
+            compose["volumes"]["postgres_data"] = {}
+
+        self._generate_container_init_scripts(datastores)
         compose_file = self.project_root / "docker-compose.yml"
-        compose_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if yaml is not None:
+            compose_file.write_text(
+                yaml.dump(compose, sort_keys=False, default_flow_style=False),
+                encoding="utf-8",
+            )
+        else:
+            compose_file.write_text(self._dump_simple_yaml(compose), encoding="utf-8")
         print(f"Generated: {self._relative(compose_file)}")
+
+    def _generate_container_init_scripts(self, datastores: Sequence[str]) -> None:
+        docker_dir = self.project_root / "docker" / "init"
+        if "mysql" in datastores:
+            mysql_dir = docker_dir / "mysql"
+            mysql_dir.mkdir(parents=True, exist_ok=True)
+            (mysql_dir / "01-init.sql").write_text(
+                "CREATE DATABASE IF NOT EXISTS appdb;\n"
+                "CREATE USER IF NOT EXISTS 'appuser'@'%' IDENTIFIED BY 'change-me';\n"
+                "GRANT ALL PRIVILEGES ON appdb.* TO 'appuser'@'%';\n"
+                "FLUSH PRIVILEGES;\n",
+                encoding="utf-8",
+            )
+        if "postgres" in datastores:
+            postgres_dir = docker_dir / "postgres"
+            postgres_dir.mkdir(parents=True, exist_ok=True)
+            (postgres_dir / "01-init.sql").write_text(
+                "CREATE USER appuser WITH PASSWORD 'change-me';\n"
+                "CREATE DATABASE appdb OWNER appuser;\n",
+                encoding="utf-8",
+            )
+
+    def _dump_simple_yaml(self, value: object, indent: int = 0) -> str:
+        prefix = " " * indent
+        if isinstance(value, dict):
+            lines: List[str] = []
+            for key, item in value.items():
+                if isinstance(item, (dict, list)):
+                    lines.append(f"{prefix}{key}:")
+                    lines.append(self._dump_simple_yaml(item, indent + 2))
+                else:
+                    lines.append(f"{prefix}{key}: {self._yaml_scalar(item)}")
+            return "\n".join(lines) + ("\n" if indent == 0 else "")
+        if isinstance(value, list):
+            lines = []
+            for item in value:
+                if isinstance(item, (dict, list)):
+                    lines.append(f"{prefix}-")
+                    lines.append(self._dump_simple_yaml(item, indent + 2))
+                else:
+                    lines.append(f"{prefix}- {self._yaml_scalar(item)}")
+            return "\n".join(lines)
+        return f"{prefix}{self._yaml_scalar(value)}"
+
+    def _yaml_scalar(self, value: object) -> str:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if value is None:
+            return "null"
+        if isinstance(value, (int, float)):
+            return str(value)
+        text = str(value)
+        if text == "" or any(ch in text for ch in [":", "{", "}", "[", "]", "#", "&", "*", "?", "|", ">", "%", "@", ",", "$"]) or text.strip() != text:
+            return json.dumps(text)
+        return text
 
     def _generate_terraform(self, analysis: Dict) -> None:
         frontend = analysis["frontend"]
         backend = analysis["backend"]
         tf_dir = self.project_root / "terraform"
         tf_dir.mkdir(parents=True, exist_ok=True)
+        app_port = backend.get("port", frontend.get("port", 8080))
 
         ingress_blocks = [
             """  ingress {
@@ -1425,10 +1597,10 @@ jobs:
         if backend.get("exists"):
             ingress_blocks.append(
                 f"""  ingress {{
-    from_port   = {backend.get('port', 8000)}
-    to_port     = {backend.get('port', 8000)}
+    from_port   = {app_port}
+    to_port     = {app_port}
     protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
+    cidr_blocks = [var.application_ingress_cidr]
   }}"""
             )
 
@@ -1447,6 +1619,10 @@ provider "aws" {{
   region = var.aws_region
 }}
 
+locals {{
+  app_name = "{self.config.get('pipeline_name', 'devops-pipeline')}"
+}}
+
 data "aws_ami" "ubuntu" {{
   most_recent = true
   owners      = ["099720109477"]
@@ -1458,7 +1634,7 @@ data "aws_ami" "ubuntu" {{
 }}
 
 resource "aws_security_group" "app" {{
-  name = "{self.config.get('pipeline_name', 'devops-pipeline')}-sg"
+  name = "${{local.app_name}}-sg"
 
 {os.linesep.join(ingress_blocks)}
 
@@ -1474,35 +1650,83 @@ resource "aws_instance" "{resource_name}" {{
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   vpc_security_group_ids = [aws_security_group.app.id]
+  user_data              = templatefile("${{path.module}}/user_data.sh", {{
+    app_name = local.app_name
+    app_port = var.app_port
+  }})
 
   tags = {{
-    Name        = "{self.config.get('pipeline_name', 'devops-pipeline')}-instance"
+    Name        = "${{local.app_name}}-instance"
     Environment = var.environment
   }}
 }}
+"""
+        variables_tf = f"""variable "aws_region" {{
+  type    = string
+  default = "us-east-1"
+}}
 
-output "instance_ip" {{
+variable "instance_type" {{
+  type    = string
+  default = "t3.micro"
+}}
+
+variable "environment" {{
+  type    = string
+  default = "production"
+}}
+
+variable "app_port" {{
+  type    = number
+  default = {app_port}
+}}
+
+variable "application_ingress_cidr" {{
+  type    = string
+  default = "10.0.0.0/16"
+}}
+"""
+        outputs_tf = f"""output "instance_ip" {{
   value       = aws_instance.{resource_name}.public_ip
   description = "Public IP of the application host"
 }}
+
+output "instance_id" {{
+  value       = aws_instance.{resource_name}.id
+  description = "EC2 instance id"
+}}
+
+output "security_group_id" {{
+  value       = aws_security_group.app.id
+  description = "Security group attached to the application host"
+}}
 """
-        variables_tf = """variable "aws_region" {
-  type    = string
-  default = "us-east-1"
-}
+        tfvars_example = f"""aws_region = "us-east-1"
+instance_type = "{self.config.get('instance_type', 't3.micro')}"
+environment = "{self.config.get('environment', 'production')}"
+app_port = {app_port}
+application_ingress_cidr = "10.0.0.0/16"
+"""
+        user_data = """#!/bin/bash
+set -euxo pipefail
 
-variable "instance_type" {
-  type    = string
-  default = "t3.micro"
-}
+apt-get update
+apt-get install -y docker.io docker-compose-plugin
+systemctl enable docker
+systemctl start docker
 
-variable "environment" {
-  type    = string
-  default = "production"
-}
+mkdir -p /opt/${app_name}
+cat >/etc/motd <<EOM
+${app_name} bootstrap complete.
+Application port: ${app_port}
+Deploy your compose bundle or container image into /opt/${app_name}.
+EOM
 """
         (tf_dir / "main.tf").write_text(main_tf, encoding="utf-8")
         (tf_dir / "variables.tf").write_text(variables_tf, encoding="utf-8")
+        (tf_dir / "outputs.tf").write_text(outputs_tf, encoding="utf-8")
+        (tf_dir / "terraform.tfvars.example").write_text(tfvars_example, encoding="utf-8")
+        (tf_dir / "user_data.sh").write_text(user_data, encoding="utf-8")
         print(f"Generated: {self._relative(tf_dir)}")
 
     def _generate_readme(self, analysis: Dict, ai_insights: Dict) -> None:

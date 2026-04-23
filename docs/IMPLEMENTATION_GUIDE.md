@@ -64,6 +64,42 @@ python ai_devops_agent.py --project-root /path/to/repo --mode ai
 python ai_devops_agent.py --openai-model gpt-5.4-mini --mode ai
 ```
 
+## pipeline_request.txt
+
+`pipeline_request.txt` is optional.
+
+If present, the generator currently uses these keys:
+
+- `pipeline_name`
+- `target`
+- `environment`
+- `instance_type`
+- `database_engine`
+
+Minimal example:
+
+```txt
+pipeline_name: example-service-ai-pipeline
+target: aws_ec2
+```
+
+Sensible defaults are used when the file is missing:
+
+- `pipeline_name: devops-pipeline`
+- `target: aws_ec2`
+- `environment: production`
+- `instance_type: t3.micro`
+
+Optional fuller example:
+
+```txt
+pipeline_name: example-service-ai-pipeline
+target: aws_ec2
+environment: production
+instance_type: t3.micro
+database_engine: postgres
+```
+
 ## Outputs
 
 The run writes:
@@ -75,6 +111,17 @@ The run writes:
 - `terraform/variables.tf`
 - `README_GENERATED.md`
 
+## Sample Requirements File
+
+Use a small, readable `requirements.txt` in the agent repository:
+
+```txt
+requests>=2.31,<3.0
+PyYAML>=6.0,<7.0
+```
+
+If you are documenting target repositories, keep their runtime dependencies separate from the agent's own requirements.
+
 ## GitHub Actions Template
 
 The template in `templates/github-actions/ai-devops-agent-template.yml` should:
@@ -83,6 +130,31 @@ The template in `templates/github-actions/ai-devops-agent-template.yml` should:
 - provide `OPENAI_API_TOKEN`
 - run `python ai_devops_agent.py --mode ai`
 - upload `AI_DEVOPS_REPORT.md` and generated artifacts
+
+## Working Workflow Example
+
+The example workflow now matches the working Pet Clinic implementation pattern:
+
+- run on pull request open, sync, reopen, and close
+- comment on open PRs with `AI_DEVOPS_REPORT.md`
+- support manual `workflow_dispatch`
+- optionally create a PR for generated outputs on manual runs
+- create a follow-up PR after a merged pull request
+
+Example command used by the workflow:
+
+```bash
+python "$AGENT_PATH" \
+  --project-root . \
+  --config-file pipeline_request.txt \
+  --mode ai
+```
+
+Required GitHub secrets and variables for the example workflow:
+
+- `OPENAI_API_TOKEN`
+- `PAT_TOKEN` for pull request creation
+- optional cloud deployment secrets and variables such as `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION`
 
 ## Operational Notes
 

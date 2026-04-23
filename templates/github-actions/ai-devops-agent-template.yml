@@ -2,7 +2,7 @@ name: AI DevOps Agent
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, closed]
   workflow_dispatch:
     inputs:
       create_pull_request:
@@ -31,8 +31,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository for PR analysis or manual run
+        if: github.event_name != 'pull_request' || github.event.action != 'closed'
         uses: actions/checkout@v4
+
+      - name: Checkout merged base branch for follow-up PR
+        if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
 
       - name: Checkout AI DevOps Agent source
         uses: actions/checkout@v4
@@ -75,7 +83,7 @@ jobs:
             docker-compose.yml
 
       - name: Comment on pull request
-        if: github.event_name == 'pull_request' && always()
+        if: github.event_name == 'pull_request' && github.event.action != 'closed' && always()
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -96,13 +104,43 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.create_pull_request
         uses: peter-evans/create-pull-request@v7
         with:
+          token: ${{ secrets.PAT_TOKEN }}
           branch: chore/ai-devops-agent-${{ github.run_id }}
-          commit-message: "chore: apply AI DevOps agent outputs"
-          title: "chore: apply AI DevOps agent outputs"
+          commit-message: 'chore: apply AI DevOps agent outputs'
+          title: 'chore: apply AI DevOps agent outputs'
+          add-paths: |
+            AI_DEVOPS_REPORT.md
+            README_GENERATED.md
+            .github/workflows/pipeline.yml
+            terraform
+            docker-compose.yml
           body: |
             This pull request was created by the AI DevOps Agent workflow.
 
             - Mode: `ai`
+            - Source: `${{ env.DEVOPS_AGENT_SOURCE_REPO }}@${{ env.DEVOPS_AGENT_REF }}`
+
+            Review the AI report, generated workflow, Terraform, Docker Compose, and README output before merge.
+
+      - name: Create follow-up pull request after merge
+        if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          branch: chore/ai-devops-follow-up-${{ github.run_id }}
+          commit-message: 'chore: apply AI DevOps follow-up changes'
+          title: 'chore: AI DevOps follow-up suggestions'
+          add-paths: |
+            AI_DEVOPS_REPORT.md
+            README_GENERATED.md
+            .github/workflows/pipeline.yml
+            terraform
+            docker-compose.yml
+          body: |
+            This pull request was created automatically after PR #${{ github.event.pull_request.number }} was merged.
+
+            - Trigger: merged PR follow-up
+            - Source PR: #${{ github.event.pull_request.number }}
             - Source: `${{ env.DEVOPS_AGENT_SOURCE_REPO }}@${{ env.DEVOPS_AGENT_REF }}`
 
             Review the AI report, generated workflow, Terraform, Docker Compose, and README output before merge.
