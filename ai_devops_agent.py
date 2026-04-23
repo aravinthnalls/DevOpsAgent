@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import requests
 import subprocess
 import sys
 from collections import Counter
@@ -114,6 +115,8 @@ class ProjectAnalyzer:
         repo_summary = self._analyze_repository()
         frontend = self._analyze_frontend()
         backend = self._analyze_backend()
+        if frontend.get("exists") and frontend.get("type") == "spring-static" and backend.get("exists"):
+            frontend["port"] = backend.get("port", frontend.get("port"))
         infrastructure = self._analyze_infrastructure(frontend, backend)
         docker = self._analyze_docker()
         git = self._analyze_git()
@@ -251,12 +254,37 @@ class ProjectAnalyzer:
                 )
             )
 
+        spring_template_dir = self.project_root / "src" / "main" / "resources" / "templates"
+        spring_static_dir = self.project_root / "src" / "main" / "resources" / "static"
+        if spring_template_dir.exists() or spring_static_dir.exists():
+            score = 6
+            if spring_template_dir.exists():
+                score += 2
+            if spring_static_dir.exists():
+                score += 2
+            candidates.append(
+                ComponentCandidate(
+                    path=spring_template_dir if spring_template_dir.exists() else spring_static_dir,
+                    score=score,
+                    language="html-css-js",
+                    framework="server-rendered-html",
+                    kind="spring-static",
+                )
+            )
+
         if not candidates:
             return {"exists": False}
 
         best = max(candidates, key=lambda item: (item.score, -len(item.path.parts)))
         package_file = best.path / "package.json"
         package_data = self._load_json(package_file) if package_file.exists() else {}
+        html_templates = list(best.path.rglob("*.html")) if best.path.exists() else []
+        static_assets = [
+            self._relative(path)
+            for path in (self.project_root / "src" / "main" / "resources" / "static").rglob("*")
+            if path.is_file() and not self._is_ignored(path)
+        ] if best.kind == "spring-static" else []
+        frontend_port = self._detect_port(self.project_root if best.kind == "spring-static" else best.path, 3000)
 
         return {
             "exists": True,
@@ -264,9 +292,13 @@ class ProjectAnalyzer:
             "type": best.kind,
             "language": best.language,
             "framework": best.framework,
-            "port": self._detect_port(best.path, 3000),
+            "port": frontend_port,
             "scripts": package_data.get("scripts", {}),
             "dependencies": sorted(self._combined_dependencies(package_data).keys())[:25],
+            "template_count": len(html_templates),
+            "template_examples": [self._relative(path) for path in html_templates[:8]],
+            "static_asset_examples": static_assets[:8],
+            "evidence": self._collect_frontend_evidence(best.path, best.kind, package_data),
         }
 
     def _analyze_backend(self) -> Dict:
@@ -323,6 +355,21 @@ class ProjectAnalyzer:
             dependencies = self._read_requirements(best.path / "requirements.txt")
         elif (best.path / "package.json").exists():
             dependencies = sorted(self._combined_dependencies(self._load_json(best.path / "package.json")).keys())[:25]
+        elif (best.path / "pom.xml").exists():
+            dependencies = self._extract_xml_artifact_ids(best.path / "pom.xml")
+        elif (best.path / "build.gradle").exists():
+            dependencies = self._extract_gradle_dependencies(best.path / "build.gradle")
+        elif (best.path / "build.gradle.kts").exists():
+            dependencies = self._extract_gradle_dependencies(best.path / "build.gradle.kts")
+
+        tests = self._discover_tests(best.path, best.language)
+        databases = self._detect_datastores(best.path)
+        build_files = [
+            self._relative(best.path / name)
+            for name in ("pom.xml", "build.gradle", "build.gradle.kts", "requirements.txt", "pyproject.toml", "package.json", "go.mod")
+            if (best.path / name).exists()
+        ]
+        runtime = self._detect_runtime(best.path, best.language)
 
         return {
             "exists": True,
@@ -330,8 +377,13 @@ class ProjectAnalyzer:
             "type": best.kind,
             "language": best.language,
             "framework": best.framework,
-            "port": self._detect_port(best.path, 8000),
+            "port": self._detect_port(best.path, 8080 if best.language == "java" else 8000),
             "dependencies": dependencies,
+            "build_files": build_files,
+            "tests": tests,
+            "datastores": databases,
+            "runtime": runtime,
+            "entrypoints": self._find_backend_entrypoints(best.path, best.language),
         }
 
     def _analyze_infrastructure(self, frontend: Dict, backend: Dict) -> Dict:
@@ -360,12 +412,20 @@ class ProjectAnalyzer:
             for path in self._find_yaml_with_markers(("Resources:", "AWSTemplateFormatVersion"))
             if not self._is_ignored(path)
         ]
+        db_init_files = [
+            self._relative(path)
+            for path in self.project_root.rglob("*.sql")
+            if not self._is_ignored(path)
+        ]
+        compose_services = self._parse_compose_services()
 
         suggestions: List[str] = []
         if backend.get("exists") and not terraform_files and not kubernetes_files and not helm_charts:
             suggestions.append("Backend detected but no Terraform, Kubernetes, or Helm configuration was found.")
         if frontend.get("exists") and backend.get("exists") and not (self.project_root / "docker-compose.yml").exists():
             suggestions.append("Full-stack app detected without docker-compose.yml for local orchestration.")
+        if compose_services and backend.get("exists") and backend.get("framework") == "spring-boot":
+            suggestions.append("Existing docker-compose services suggest database dependencies that should be reflected in generated IaC.")
 
         return {
             "terraform_exists": bool(terraform_files),
@@ -374,6 +434,8 @@ class ProjectAnalyzer:
             "helm_charts": sorted(set(helm_charts)),
             "ansible_files": ansible_files,
             "cloudformation_files": cloudformation_files,
+            "db_init_files": db_init_files[:20],
+            "compose_services": compose_services,
             "suggestions": suggestions,
         }
 
@@ -444,21 +506,21 @@ class ProjectAnalyzer:
                         "severity": "HIGH",
                         "file": self._relative(workflow_file),
                         "issue": "Workflow calls unsupported --apply-fixes flag.",
-                        "fix": "Use supported modes only: analyze-only, generate, generate-and-commit, suggest-changes.",
+                        "fix": "Run the agent only with --mode ai.",
                     })
                 if "suggestions.md" in content and "SUGGESTIONS.md" not in content:
                     issues.append({
                         "severity": "MEDIUM",
                         "file": self._relative(workflow_file),
-                        "issue": "Workflow expects suggestions.md but the agent writes SUGGESTIONS.md.",
-                        "fix": "Update artifact and PR comment steps to use SUGGESTIONS.md.",
+                        "issue": "Workflow expects suggestions.md but the agent now writes AI_DEVOPS_REPORT.md.",
+                        "fix": "Update artifact and PR comment steps to use AI_DEVOPS_REPORT.md.",
                     })
-                if "generate-pipeline" in content:
+                if "generate-pipeline" in content or "suggest-changes" in content or "generate-and-commit" in content or "analyze-only" in content:
                     issues.append({
                         "severity": "MEDIUM",
                         "file": self._relative(workflow_file),
-                        "issue": "Workflow dispatch mode uses generate-pipeline instead of the supported generate mode.",
-                        "fix": "Replace generate-pipeline with generate.",
+                        "issue": "Workflow references legacy execution modes.",
+                        "fix": "Replace legacy execution modes with the single supported ai mode.",
                     })
 
             if not workflow["runs_tests"]:
@@ -629,14 +691,30 @@ class ProjectAnalyzer:
             strengths.append(
                 f"Frontend detected at {frontend['path']} using {frontend['language']} / {frontend['framework']}."
             )
+            if frontend.get("template_count"):
+                strengths.append(
+                    f"Frontend includes {frontend['template_count']} HTML template files, indicating server-rendered UI coverage."
+                )
         if backend.get("exists"):
             strengths.append(
                 f"Backend detected at {backend['path']} using {backend['language']} / {backend['framework']}."
             )
+            if backend.get("tests"):
+                strengths.append(
+                    f"Backend test assets detected: {backend['tests'].get('count', 0)} file(s)."
+                )
+            if backend.get("datastores"):
+                strengths.append(
+                    f"Backend datastore signals detected: {', '.join(backend['datastores'])}."
+                )
         if infrastructure.get("terraform_exists"):
             strengths.append("Repository already contains Terraform configuration.")
         if github_actions.get("exists"):
             strengths.append("Repository already contains GitHub Actions workflows.")
+        if infrastructure.get("compose_services"):
+            strengths.append(
+                f"Docker Compose services detected: {', '.join(infrastructure['compose_services'])}."
+            )
 
         if frontend.get("exists") and backend.get("exists") and not docker.get("compose_exists"):
             gaps.append("Frontend and backend were detected, but docker-compose is missing.")
@@ -644,6 +722,8 @@ class ProjectAnalyzer:
         if backend.get("exists") and not infrastructure.get("terraform_exists") and not infrastructure.get("kubernetes_files"):
             gaps.append("Backend exists but no deployable IaC was found.")
             suggestions.append("Add Terraform, Helm, or Kubernetes manifests for repeatable environment provisioning.")
+            if backend.get("framework") == "spring-boot":
+                suggestions.append("Generate IaC for a Java web app plus its database dependencies, not only the application host.")
         if github_actions.get("exists") and github_actions.get("issues"):
             gaps.append("Existing GitHub Actions workflows contain drift against current agent capabilities.")
             suggestions.append("Align workflow inputs, filenames, and supported CLI modes with the current agent.")
@@ -652,6 +732,11 @@ class ProjectAnalyzer:
             if not any((backend_path / name).exists() for name in ("requirements.txt", "pyproject.toml")):
                 gaps.append("Python backend exists without a clear dependency manifest.")
                 suggestions.append("Add requirements.txt or pyproject.toml for deterministic installs.")
+        if backend.get("language") == "java" and not backend.get("tests", {}).get("count"):
+            gaps.append("Java backend detected without obvious test sources.")
+            suggestions.append("Add Maven or Gradle test execution and ensure test sources are committed.")
+        if frontend.get("framework") == "server-rendered-html":
+            suggestions.append("Treat embedded templates and static assets as the frontend surface when assessing coverage and delivery needs.")
 
         if not strengths:
             suggestions.append(
@@ -737,6 +822,141 @@ class ProjectAnalyzer:
                 return "spring-boot"
         return "generic-java"
 
+    def _detect_runtime(self, backend_path: Path, language: str) -> Dict:
+        runtime: Dict[str, str] = {}
+        if language == "java":
+            if (backend_path / "pom.xml").exists():
+                runtime["build_tool"] = "maven"
+            elif (backend_path / "build.gradle").exists() or (backend_path / "build.gradle.kts").exists():
+                runtime["build_tool"] = "gradle"
+            runtime["java_version"] = self._extract_java_version(backend_path)
+        elif language == "python":
+            runtime["build_tool"] = "pip"
+        elif language in {"javascript", "typescript"}:
+            runtime["build_tool"] = "npm"
+        return runtime
+
+    def _extract_java_version(self, backend_path: Path) -> str:
+        pom = backend_path / "pom.xml"
+        if pom.exists():
+            content = self._safe_read_text(pom)
+            match = re.search(r"<java\.version>([^<]+)</java\.version>", content)
+            if match:
+                return match.group(1).strip()
+        gradle = backend_path / "build.gradle"
+        if gradle.exists():
+            content = self._safe_read_text(gradle)
+            match = re.search(r"JavaLanguageVersion\.of\((\d+)\)", content)
+            if match:
+                return match.group(1)
+        return "unknown"
+
+    def _extract_xml_artifact_ids(self, path: Path) -> List[str]:
+        content = self._safe_read_text(path)
+        return re.findall(r"<artifactId>([^<]+)</artifactId>", content)[:25]
+
+    def _extract_gradle_dependencies(self, path: Path) -> List[str]:
+        content = self._safe_read_text(path)
+        return re.findall(r"['\"]([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+:[^'\"]+)['\"]", content)[:25]
+
+    def _discover_tests(self, backend_path: Path, language: str) -> Dict:
+        test_files: List[Path] = []
+        patterns = {
+            "java": ["*Test.java", "*Tests.java"],
+            "python": ["test_*.py", "*_test.py"],
+            "javascript": ["*.test.js", "*.spec.js"],
+            "typescript": ["*.test.ts", "*.spec.ts"],
+            "go": ["*_test.go"],
+        }
+        for pattern in patterns.get(language, []):
+            test_files.extend(path for path in backend_path.rglob(pattern) if not self._is_ignored(path))
+        return {
+            "count": len(test_files),
+            "examples": [self._relative(path) for path in sorted(test_files)[:8]],
+        }
+
+    def _detect_datastores(self, backend_path: Path) -> List[str]:
+        markers = {
+            "h2": ("h2",),
+            "mysql": ("mysql", "mysql-connector"),
+            "postgres": ("postgres", "postgresql"),
+            "mariadb": ("mariadb",),
+        }
+        found: List[str] = []
+        for file in backend_path.rglob("*"):
+            if self._is_ignored(file) or not file.is_file():
+                continue
+            if file.suffix.lower() not in TEXT_FILE_EXTENSIONS and file.name not in {"pom.xml", "build.gradle", "build.gradle.kts"}:
+                continue
+            content = self._safe_read_text(file, 12000).lower()
+            for name, tokens in markers.items():
+                if name not in found and any(token in content for token in tokens):
+                    found.append(name)
+        return found
+
+    def _find_backend_entrypoints(self, backend_path: Path, language: str) -> List[str]:
+        entrypoints: List[str] = []
+        if language == "java":
+            for file in backend_path.rglob("*.java"):
+                if self._is_ignored(file):
+                    continue
+                rel = self._relative(file)
+                if "/src/test/" in f"/{rel}":
+                    continue
+                content = self._safe_read_text(file, 12000)
+                if "@SpringBootApplication" in content or "public static void main" in content:
+                    entrypoints.append(rel)
+        elif language == "python":
+            for file in backend_path.rglob("*.py"):
+                if self._is_ignored(file):
+                    continue
+                content = self._safe_read_text(file, 12000)
+                if re.search(r"if __name__ == [\"']__main__[\"']", content):
+                    entrypoints.append(self._relative(file))
+        return entrypoints[:8]
+
+    def _collect_frontend_evidence(self, frontend_path: Path, frontend_kind: str, package_data: Dict) -> List[str]:
+        evidence: List[str] = []
+        if frontend_kind == "spring-static":
+            templates_dir = self.project_root / "src" / "main" / "resources" / "templates"
+            static_dir = self.project_root / "src" / "main" / "resources" / "static"
+            if templates_dir.exists():
+                evidence.append(f"Spring templates found in `{self._relative(templates_dir)}`.")
+            if static_dir.exists():
+                evidence.append(f"Static assets found in `{self._relative(static_dir)}`.")
+        if package_data.get("scripts"):
+            evidence.append("package.json scripts indicate a buildable frontend application.")
+        return evidence
+
+    def _parse_compose_services(self) -> List[str]:
+        services: List[str] = []
+        for rel_path in [
+            self._relative(path)
+            for path in self.project_root.rglob("docker-compose*.yml")
+            if not self._is_ignored(path)
+        ] + [
+            self._relative(path)
+            for path in self.project_root.rglob("docker-compose*.yaml")
+            if not self._is_ignored(path)
+        ]:
+            path = self.project_root / rel_path
+            content = self._safe_read_text(path)
+            if yaml is not None:
+                try:
+                    parsed = yaml.safe_load(content) or {}
+                    if isinstance(parsed, dict):
+                        for name in (parsed.get("services") or {}).keys():
+                            if name not in services:
+                                services.append(str(name))
+                        continue
+                except Exception:
+                    pass
+            for match in re.finditer(r"^\s{2}([A-Za-z0-9_.-]+):\s*$", content, re.MULTILINE):
+                name = match.group(1)
+                if name != "services" and name not in services:
+                    services.append(name)
+        return services
+
     def _detect_go_framework(self, backend_path: Path) -> str:
         for file in backend_path.rglob("*.go"):
             if self._is_ignored(file):
@@ -805,6 +1025,91 @@ class ProjectAnalyzer:
         return any(part in IGNORED_DIRS for part in path.parts)
 
 
+class OpenAIEnricher:
+    """Uses the OpenAI API to turn static analysis into richer DevOps guidance."""
+
+    def __init__(self, token: str, model: str = "gpt-5.4-mini"):
+        self.token = token
+        self.model = model
+        self.endpoint = "https://api.openai.com/v1/chat/completions"
+
+    def enrich(self, analysis: Dict) -> Dict:
+        prompt = self._build_prompt(analysis)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior DevOps architect. "
+                        "Review the repository analysis and return only valid JSON. "
+                        "Focus on architecture, CI/CD, IaC, security, operational maturity, "
+                        "and concrete next steps."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "response_format": {"type": "json_object"},
+        }
+
+        response = requests.post(
+            self.endpoint,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=120,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        text = ""
+        choices = data.get("choices", [])
+        if choices:
+            text = choices[0].get("message", {}).get("content", "") or ""
+        if not text:
+            raise ValueError("OpenAI response did not include any content")
+
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("OpenAI response was not valid JSON") from exc
+
+        result["model"] = self.model
+        return result
+
+    def _build_prompt(self, analysis: Dict) -> str:
+        compact = {
+            "repository": analysis.get("repository", {}),
+            "frontend": analysis.get("frontend", {}),
+            "backend": analysis.get("backend", {}),
+            "infrastructure": analysis.get("infrastructure", {}),
+            "docker": analysis.get("docker", {}),
+            "github_actions": analysis.get("github_actions", {}),
+            "security": analysis.get("security", {}),
+            "best_practices": analysis.get("best_practices", {}),
+        }
+        return (
+            "Analyze this repository scan and return JSON with the following keys:\n"
+            "executive_summary: string\n"
+            "architecture_summary: string\n"
+            "frontend_assessment: string\n"
+            "backend_assessment: string\n"
+            "iac_recommendations: array of strings\n"
+            "workflow_review: array of strings\n"
+            "security_priorities: array of strings\n"
+            "quick_wins: array of strings\n"
+            "long_term_improvements: array of strings\n"
+            "generated_asset_guidance: object with keys terraform, workflow, docker_compose, readme and string values\n"
+            "Keep recommendations concrete and based only on the supplied scan.\n\n"
+            f"Repository scan:\n{json.dumps(compact, indent=2)}"
+        )
+
+
 class PipelineGenerator:
     """Generates CI/CD pipeline files and infrastructure code."""
 
@@ -840,14 +1145,14 @@ class PipelineGenerator:
             "backend_port": "8000",
         }
 
-    def generate(self) -> bool:
+    def generate(self, analysis: Optional[Dict] = None, ai_insights: Optional[Dict] = None) -> bool:
         print("Generating pipeline components...")
-        analysis = self.analyzer.analyze()
+        analysis = analysis or self.analyzer.analyze()
         self._generate_github_workflow(analysis)
         if analysis["frontend"].get("exists") or analysis["backend"].get("exists"):
             self._generate_docker_compose(analysis)
         self._generate_terraform(analysis)
-        self._generate_readme(analysis)
+        self._generate_readme(analysis, ai_insights or {})
         print("Pipeline generation complete")
         return True
 
@@ -863,16 +1168,17 @@ class PipelineGenerator:
         backend_steps = ""
 
         if frontend.get("exists"):
-            frontend_setup = """      - name: Set up Node.js
+            if frontend.get("type") != "spring-static":
+                frontend_setup = """      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 """
-            frontend_path = frontend["path"]
-            frontend_install = self._frontend_install_command(frontend)
-            frontend_test = self._frontend_test_command(frontend)
-            frontend_build = self._frontend_build_command(frontend)
-            frontend_steps = f"""      - name: Install frontend dependencies
+                frontend_path = frontend["path"]
+                frontend_install = self._frontend_install_command(frontend)
+                frontend_test = self._frontend_test_command(frontend)
+                frontend_build = self._frontend_build_command(frontend)
+                frontend_steps = f"""      - name: Install frontend dependencies
         working-directory: {frontend_path}
         run: {frontend_install}
 
@@ -883,6 +1189,12 @@ class PipelineGenerator:
       - name: Build frontend
         working-directory: {frontend_path}
         run: {frontend_build}
+"""
+            else:
+                frontend_steps = """      - name: Validate server-rendered frontend assets
+        run: |
+          test -d src/main/resources/templates
+          test -d src/main/resources/static || true
 """
 
         if backend.get("exists") and backend.get("language") == "python":
@@ -918,6 +1230,20 @@ class PipelineGenerator:
       - name: Test backend
         working-directory: {backend_path}
         run: npm test --if-present
+"""
+        elif backend.get("exists") and backend.get("language") == "java":
+            backend_setup = """      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+"""
+            build_command = "./mvnw test" if (self.project_root / "mvnw").exists() else "./gradlew test"
+            backend_steps = f"""      - name: Test backend
+        working-directory: {backend['path']}
+        run: |
+          chmod +x mvnw gradlew 2>/dev/null || true
+          {build_command}
 """
 
         docker_step = ""
@@ -983,7 +1309,7 @@ jobs:
         backend = analysis["backend"]
         lines = ["version: '3.9'", "services:"]
 
-        if frontend.get("exists"):
+        if frontend.get("exists") and frontend.get("type") != "spring-static":
             lines.extend([
                 "  frontend:",
                 f"    build: ./{frontend['path']}",
@@ -994,11 +1320,12 @@ jobs:
             ])
 
         if backend.get("exists"):
+            internal_port = backend.get("port", 8080 if backend.get("language") == "java" else 8000)
             lines.extend([
                 "  backend:",
                 f"    build: ./{backend['path']}",
                 "    ports:",
-                f"      - '{backend.get('port', 8000)}:8000'",
+                f"      - '{internal_port}:{internal_port}'",
                 "    environment:",
                 "      APP_ENV: production",
                 "      DEBUG: 'false'",
@@ -1028,7 +1355,7 @@ jobs:
     cidr_blocks = ["0.0.0.0/0"]
   }""",
         ]
-        if frontend.get("exists"):
+        if frontend.get("exists") and frontend.get("type") != "spring-static":
             ingress_blocks.append(
                 f"""  ingress {{
     from_port   = {frontend.get('port', 3000)}
@@ -1120,7 +1447,7 @@ variable "environment" {
         (tf_dir / "variables.tf").write_text(variables_tf, encoding="utf-8")
         print(f"Generated: {self._relative(tf_dir)}")
 
-    def _generate_readme(self, analysis: Dict) -> None:
+    def _generate_readme(self, analysis: Dict, ai_insights: Dict) -> None:
         repo = analysis["repository"]
         frontend = analysis["frontend"]
         backend = analysis["backend"]
@@ -1165,6 +1492,15 @@ Generated by AI DevOps Agent on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ## Security Findings
 
 {self._format_security_findings(analysis['security'])}
+
+## AI Guidance
+
+- Executive summary: {ai_insights.get('executive_summary', 'No AI summary generated.')}
+- Architecture: {ai_insights.get('architecture_summary', 'No AI architecture summary generated.')}
+
+### AI Quick Wins
+
+{self._format_markdown_list(ai_insights.get('quick_wins', []), fallback='- No AI quick wins generated.')}
 """
 
         readme_file = self.project_root / "README_GENERATED.md"
@@ -1210,96 +1546,124 @@ Generated by AI DevOps Agent on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         return str(path.relative_to(self.project_root))
 
 
-class WorkflowOrchestrator:
-    """Orchestrates execution modes and report output."""
+class AIDevOpsAgent:
+    """Single AI mode runner for analysis, enrichment, and generation."""
 
-    def __init__(self, project_root: str, config_file: str, openai_token: Optional[str] = None):
+    def __init__(
+        self,
+        project_root: str,
+        config_file: str,
+        openai_token: str,
+        openai_model: str = "gpt-5.4-mini",
+    ):
         self.project_root = Path(project_root).resolve()
         self.config_file = config_file
         self.analyzer = ProjectAnalyzer(str(self.project_root), openai_token)
         self.generator = PipelineGenerator(str(self.project_root), config_file, openai_token)
+        self.enricher = OpenAIEnricher(openai_token, openai_model)
 
-    def run(self, mode: str) -> bool:
-        if mode == "analyze-only":
-            return self.analyze_only()
-        if mode == "generate":
-            return self.generator.generate()
-        if mode == "generate-and-commit":
-            return self.generate_and_commit()
-        if mode == "suggest-changes":
-            return self.suggest_changes()
-        print(f"Unknown mode: {mode}")
-        return False
-
-    def analyze_only(self) -> bool:
+    def run(self) -> bool:
         analysis = self.analyzer.analyze()
-        self._print_analysis(analysis)
+        ai_insights = self.enricher.enrich(analysis)
+        self._print_analysis(analysis, ai_insights)
+        self.generator.generate(analysis, ai_insights)
+        report = self._create_ai_report(analysis, ai_insights)
+        report_file = self.project_root / "AI_DEVOPS_REPORT.md"
+        report_file.write_text(report, encoding="utf-8")
+        print(f"AI report written to: {report_file.relative_to(self.project_root)}")
         return True
 
-    def generate_and_commit(self) -> bool:
-        if not self.generator.generate():
-            return False
-        try:
-            subprocess.run(["git", "add", "."], cwd=self.project_root, check=True)
-            subprocess.run(
-                ["git", "commit", "-m", "AI: Generated CI/CD pipeline"],
-                cwd=self.project_root,
-                check=True,
-            )
-            print("Changes committed")
-        except subprocess.CalledProcessError as exc:
-            print(f"Git commit failed: {exc}")
-        return True
-
-    def suggest_changes(self) -> bool:
-        analysis = self.analyzer.analyze()
-        suggestions = self._create_suggestions(analysis)
-        output_file = self.project_root / "SUGGESTIONS.md"
-        output_file.write_text(suggestions, encoding="utf-8")
-        print(f"Suggestions written to: {output_file.relative_to(self.project_root)}")
-        return True
-
-    def _create_suggestions(self, analysis: Dict) -> str:
+    def _create_ai_report(self, analysis: Dict, ai_insights: Dict) -> str:
         frontend = analysis["frontend"]
         backend = analysis["backend"]
         infrastructure = analysis["infrastructure"]
         workflows = analysis["github_actions"]
         best_practices = analysis["best_practices"]
+        docker = analysis["docker"]
+        repo = analysis["repository"]
 
-        return f"""# AI DevOps Agent - Suggestions
+        return f"""# AI DevOps Agent Report
 
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+OpenAI model: `{ai_insights.get('model', 'unknown')}`
+
+## Executive Summary
+
+{ai_insights.get('executive_summary', 'No AI summary generated.')}
 
 ## Repository Summary
 
-- Files scanned: {analysis['repository'].get('file_count', 0)}
-- Top languages: {self._format_mapping(analysis['repository'].get('top_languages', {}))}
+- Files scanned: {repo.get('file_count', 0)}
+- Top languages: {self._format_mapping(repo.get('top_languages', {}))}
+- Important manifests: {', '.join(repo.get('important_files', [])[:12]) or 'None detected'}
 
-## Frontend
+## Architecture
+
+- AI architecture summary: {ai_insights.get('architecture_summary', 'No AI architecture summary generated.')}
+- Frontend: {ai_insights.get('frontend_assessment', 'No AI frontend assessment generated.')}
+- Backend: {ai_insights.get('backend_assessment', 'No AI backend assessment generated.')}
+
+## Frontend Detection
 
 {self._format_component_status(frontend)}
 
-## Backend
+### Frontend Evidence
+{self._format_simple_list(frontend.get('evidence', []), 'No direct frontend evidence captured.')}
+
+### Frontend Assets
+{self._format_simple_list(frontend.get('template_examples', []), 'No template examples captured.')}
+{self._format_labeled_list('Static asset examples', frontend.get('static_asset_examples', []))}
+
+## Backend Detection
 
 {self._format_component_status(backend)}
+
+### Backend Runtime
+{self._format_mapping_lines(backend.get('runtime', {}), 'No runtime metadata captured.')}
+
+### Backend Entry Points
+{self._format_simple_list(backend.get('entrypoints', []), 'No entrypoints captured.')}
+
+### Backend Tests
+{self._format_test_summary(backend.get('tests', {}))}
+
+### Backend Dependencies
+{self._format_simple_list(backend.get('dependencies', [])[:12], 'No dependency summary captured.')}
+
+### Datastore Signals
+{self._format_simple_list(backend.get('datastores', []), 'No datastore signals detected.')}
 
 ## IaC Review
 
 - Terraform: {'Yes' if infrastructure.get('terraform_exists') else 'No'}
 - Kubernetes manifests: {len(infrastructure.get('kubernetes_files', []))}
 - Helm charts: {len(infrastructure.get('helm_charts', []))}
-- Docker Compose: {'Yes' if analysis['docker'].get('compose_exists') else 'No'}
+- Docker Compose: {'Yes' if docker.get('compose_exists') else 'No'}
+- Compose services: {', '.join(infrastructure.get('compose_services', [])) or 'None detected'}
+- SQL/bootstrap assets: {len(infrastructure.get('db_init_files', []))}
 
-## GitHub Actions Review
+### Heuristic IaC Recommendations
+{self._format_iac_recommendations(frontend, backend, infrastructure)}
+
+### AI IaC Recommendations
+{self._format_simple_list(ai_insights.get('iac_recommendations', []), 'No AI IaC recommendations generated.')}
+
+## Workflow Review
 
 - Workflows found: {len(workflows.get('workflows', []))}
 {self._format_issue_lines(workflows.get('issues', []), 'No workflow issues auto-detected.')}
 
-## Security Recommendations
+### AI Workflow Review
+{self._format_simple_list(ai_insights.get('workflow_review', []), 'No AI workflow review generated.')}
+
+## Security Priorities
 
 {self._format_security_recommendations(analysis['security'])}
 
-## Best-Practice Suggestions
+### AI Security Priorities
+{self._format_simple_list(ai_insights.get('security_priorities', []), 'No AI security priorities generated.')}
+
+## Best-Practice Alignment
 
 ### Strengths
 {self._format_simple_list(best_practices.get('strengths', []), 'None auto-detected.')}
@@ -1307,8 +1671,18 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ### Gaps
 {self._format_simple_list(best_practices.get('gaps', []), 'No major gaps auto-detected.')}
 
-### Recommended Actions
-{self._format_simple_list(best_practices.get('suggestions', []), 'No additional actions suggested.')}
+### Heuristic Actions
+{self._format_simple_list(best_practices.get('suggestions', []), 'No additional heuristic actions suggested.')}
+
+### AI Quick Wins
+{self._format_simple_list(ai_insights.get('quick_wins', []), 'No AI quick wins generated.')}
+
+### AI Long-Term Improvements
+{self._format_simple_list(ai_insights.get('long_term_improvements', []), 'No AI long-term improvements generated.')}
+
+## Generated Asset Guidance
+
+{self._format_mapping_lines(ai_insights.get('generated_asset_guidance', {}), 'No AI asset guidance generated.')}
 """
 
     def _format_component_status(self, component: Dict) -> str:
@@ -1321,6 +1695,12 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             f"- Framework: {component.get('framework', 'unknown')}",
             f"- Port: {component.get('port', 'N/A')}",
         ]
+        if component.get("type"):
+            lines.append(f"- Type: {component.get('type')}")
+        if component.get("build_files"):
+            lines.append(f"- Build files: {', '.join(component.get('build_files', []))}")
+        if component.get("template_count"):
+            lines.append(f"- HTML templates: {component.get('template_count')}")
         return "\n".join(lines)
 
     def _format_security_recommendations(self, security: Dict) -> str:
@@ -1351,25 +1731,76 @@ Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             return f"- {fallback}"
         return "\n".join(f"- {item}" for item in items)
 
+    def _format_labeled_list(self, label: str, items: Sequence[str]) -> str:
+        if not items:
+            return f"\n### {label}\n- None captured"
+        return f"\n### {label}\n" + "\n".join(f"- {item}" for item in items)
+
     def _format_mapping(self, mapping: Dict) -> str:
         if not mapping:
             return "None"
         return ", ".join(f"{key}: {value}" for key, value in mapping.items())
 
-    def _print_analysis(self, analysis: Dict) -> None:
+    def _format_mapping_lines(self, mapping: Dict, fallback: str) -> str:
+        if not mapping:
+            return f"- {fallback}"
+        return "\n".join(f"- {key}: {value}" for key, value in mapping.items())
+
+    def _format_test_summary(self, tests: Dict) -> str:
+        if not tests:
+            return "- No test metadata captured."
+        count = tests.get("count", 0)
+        examples = tests.get("examples", [])
+        lines = [f"- Test files detected: {count}"]
+        if examples:
+            lines.extend(f"- {example}" for example in examples)
+        return "\n".join(lines)
+
+    def _format_iac_recommendations(self, frontend: Dict, backend: Dict, infrastructure: Dict) -> str:
+        recommendations: List[str] = []
+        if backend.get("framework") == "spring-boot":
+            port = backend.get("port", 8080)
+            recommendations.append(
+                f"Provision a Java application host that exposes port {port} and runs the Spring Boot service."
+            )
+        if frontend.get("framework") == "server-rendered-html":
+            recommendations.append(
+                "Treat the HTML templates and static assets as part of the deployed application package rather than a separate Node build."
+            )
+        for service in infrastructure.get("compose_services", []):
+            if service in {"mysql", "postgres", "postgresql"}:
+                recommendations.append(
+                    f"Add managed or self-hosted database infrastructure for the `{service}` service currently described in Docker Compose."
+                )
+        if not recommendations:
+            recommendations.append("No additional IaC recommendations generated.")
+        return "\n".join(f"- {item}" for item in recommendations)
+
+    def _print_analysis(self, analysis: Dict, ai_insights: Dict) -> None:
         print("=" * 60)
-        print("PROJECT ANALYSIS RESULTS")
+        print("AI DEVOPS ANALYSIS RESULTS")
         print("=" * 60)
 
         repo = analysis["repository"]
         print(f"\nFiles scanned: {repo.get('file_count', 0)}")
         print(f"Top languages: {self._format_mapping(repo.get('top_languages', {}))}")
         print(f"\nFrontend:\n{self._format_component_status(analysis['frontend'])}")
+        if analysis["frontend"].get("evidence"):
+            print("Frontend evidence:")
+            for item in analysis["frontend"]["evidence"][:5]:
+                print(f"- {item}")
         print(f"\nBackend:\n{self._format_component_status(analysis['backend'])}")
+        if analysis["backend"].get("tests"):
+            print(f"Backend tests: {analysis['backend']['tests'].get('count', 0)} file(s)")
+        if analysis["backend"].get("datastores"):
+            print(f"Backend datastores: {', '.join(analysis['backend']['datastores'])}")
         print("\nInfrastructure:")
         print(f"- Terraform: {analysis['infrastructure'].get('terraform_exists')}")
         print(f"- Kubernetes manifests: {len(analysis['infrastructure'].get('kubernetes_files', []))}")
+        print(f"- Docker Compose services: {', '.join(analysis['infrastructure'].get('compose_services', [])) or 'none'}")
         print(f"- GitHub Actions workflows: {len(analysis['github_actions'].get('workflows', []))}")
+        print(f"\nAI model: {ai_insights.get('model', 'unknown')}")
+        print(f"AI summary: {ai_insights.get('executive_summary', 'No AI summary generated.')}")
 
         all_issues = (
             analysis["security"].get("frontend", [])
@@ -1400,17 +1831,14 @@ def main() -> None:
     parser.add_argument("--project-root", default=".", help="Project root directory")
     parser.add_argument("--config-file", default="pipeline_request.txt", help="Config file")
     parser.add_argument("--openai-token", help="OpenAI API token")
+    parser.add_argument("--openai-model", default="gpt-5.4-mini", help="OpenAI model for AI analysis")
     parser.add_argument(
         "--mode",
-        choices=["analyze-only", "generate", "generate-and-commit", "suggest-changes"],
-        default="generate",
+        choices=["ai"],
+        default="ai",
         help="Execution mode",
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
-
-    parser.add_argument("--analyze-only", action="store_true", help="Only analyze the project")
-    parser.add_argument("--auto-commit", action="store_true", help="Automatically commit changes")
-    parser.add_argument("--suggest-changes", action="store_true", help="Suggest changes instead of generating")
 
     args = parser.parse_args()
 
@@ -1419,18 +1847,17 @@ def main() -> None:
 
     try:
         openai_token = args.openai_token or os.getenv("OPENAI_API_TOKEN")
-        orchestrator = WorkflowOrchestrator(args.project_root, args.config_file, openai_token)
+        if not openai_token:
+            raise ValueError("OPENAI_API_TOKEN or --openai-token is required for ai mode")
 
-        if args.analyze_only:
-            mode = "analyze-only"
-        elif args.suggest_changes:
-            mode = "suggest-changes"
-        elif args.auto_commit:
-            mode = "generate-and-commit"
-        else:
-            mode = args.mode
+        agent = AIDevOpsAgent(
+            args.project_root,
+            args.config_file,
+            openai_token,
+            args.openai_model,
+        )
 
-        success = orchestrator.run(mode)
+        success = agent.run()
         if success:
             print("\nWorkflow completed successfully")
             sys.exit(0)

@@ -1,149 +1,91 @@
 # AI DevOps Agent Implementation Guide
 
-This guide reflects the current simplified agent behavior.
+This guide reflects the current single-mode AI implementation.
 
 ## Overview
 
-The agent is a single Python entrypoint with three main responsibilities:
+The agent now follows one execution path:
 
-- `ProjectAnalyzer`: scan the full repository, identify likely application components, inspect IaC, inspect workflows, and flag risks
-- `PipelineGenerator`: generate starter workflow, Compose, Terraform, and generated documentation
-- `WorkflowOrchestrator`: expose the execution modes and write the final reports
+1. scan the repository heuristically
+2. summarize the scan into structured data
+3. send that summary to OpenAI for richer DevOps analysis
+4. write `AI_DEVOPS_REPORT.md`
+5. generate starter workflow, Compose, Terraform, and generated README assets
+
+## Core Components
+
+- `ProjectAnalyzer`: performs the deterministic repo scan
+- `OpenAIEnricher`: calls the OpenAI API and returns structured DevOps guidance
+- `PipelineGenerator`: creates starter delivery assets based on the scan
+- `AIDevOpsAgent`: runs the single `ai` flow end-to-end
 
 ## Repository Scanning Model
 
-The analyzer no longer depends on a strict `frontend/` and `backend/` layout.
+The analyzer still performs local detection for:
 
-It searches the repository for signals such as:
+- frontend technologies including React, Vue, Next.js, static HTML, and server-rendered HTML
+- backend technologies including Python, Node, Java, and Go
+- IaC signals including Terraform, Kubernetes-style YAML, Helm, Dockerfiles, and Docker Compose
+- workflow quality signals from `.github/workflows/*.yml`
 
-- `package.json`, `index.html`, JS/TS source files for frontend detection
-- `requirements.txt`, `pyproject.toml`, Python source, `go.mod`, `pom.xml`, `build.gradle`, Node server packages for backend detection
-- Terraform files, Kubernetes-style YAML, Helm charts, Dockerfiles, Docker Compose, and `.github/workflows/*.yml`
+That local scan becomes the input context for the AI enrichment step.
 
-The output is heuristic. Repositories with unusual layouts can still be analyzed, but the results should be reviewed manually.
+## AI Enrichment
 
-## Execution Modes
+The agent requires `OPENAI_API_TOKEN` or `--openai-token`.
 
-### Analyze Only
+It sends the scan summary to OpenAI and asks for JSON containing:
 
-```bash
-python ai_devops_agent.py --mode analyze-only
-```
+- executive summary
+- architecture summary
+- frontend assessment
+- backend assessment
+- IaC recommendations
+- workflow review
+- security priorities
+- quick wins
+- long-term improvements
+- generated asset guidance
 
-Prints a repo summary including:
+The default model is `gpt-5.4-mini`, configurable with `--openai-model`.
 
-- files scanned
-- top languages
-- frontend/backend detection
-- IaC/workflow counts
-- security summary
-- GitHub Actions drift findings
+## Execution
 
-### Suggest Changes
-
-```bash
-python ai_devops_agent.py --mode suggest-changes
-```
-
-Writes `SUGGESTIONS.md` containing:
-
-- repo summary
-- frontend/backend findings
-- IaC review
-- GitHub Actions review
-- security findings
-- best-practice strengths, gaps, and actions
-
-### Generate
+There is one supported mode:
 
 ```bash
-python ai_devops_agent.py --mode generate
+python ai_devops_agent.py --mode ai
 ```
 
-Generates starter assets:
+Examples:
 
+```bash
+python ai_devops_agent.py --project-root /path/to/repo --mode ai
+python ai_devops_agent.py --openai-model gpt-5.4-mini --mode ai
+```
+
+## Outputs
+
+The run writes:
+
+- `AI_DEVOPS_REPORT.md`
 - `.github/workflows/pipeline.yml`
 - `docker-compose.yml`
 - `terraform/main.tf`
 - `terraform/variables.tf`
 - `README_GENERATED.md`
 
-### Generate And Commit
+## GitHub Actions Template
 
-```bash
-python ai_devops_agent.py --mode generate-and-commit
-```
+The template in `templates/github-actions/ai-devops-agent-template.yml` should:
 
-Runs generation, then attempts a git commit.
+- install Python dependencies
+- provide `OPENAI_API_TOKEN`
+- run `python ai_devops_agent.py --mode ai`
+- upload `AI_DEVOPS_REPORT.md` and generated artifacts
 
-## Workflow Template Expectations
+## Operational Notes
 
-The template in `templates/github-actions/ai-devops-agent-template.yml` is the source of truth for workflow integration.
-
-The workflow should:
-
-- install Python and agent dependencies if needed
-- run `--mode analyze-only` for PR analysis
-- run `--mode suggest-changes` to produce `SUGGESTIONS.md`
-- use only supported modes in `workflow_dispatch`
-- avoid calling unsupported flags like `--apply-fixes`
-
-## Known Drift That Was Corrected
-
-Older workflow and documentation examples in downstream repos used stale behavior:
-
-- `generate-pipeline` instead of `generate`
-- `--apply-fixes`, which is not supported
-- `suggestions.md` instead of `SUGGESTIONS.md`
-- references to generated files that this simplified agent does not create
-
-If a target repository still uses those older names, update it to the current template.
-
-## Configuration
-
-Optional `pipeline_request.txt`:
-
-```yaml
-pipeline_name: my-service-pipeline
-environment: production
-target: aws_ec2
-instance_type: t3.micro
-frontend_port: 3000
-backend_port: 8000
-```
-
-## Rollout Guidance
-
-### Phase 1
-
-Run `analyze-only` and `suggest-changes` in pull requests.
-
-Validate:
-
-- frontend/backend detection quality
-- workflow findings
-- IaC findings
-- usefulness of best-practice suggestions
-
-### Phase 2
-
-Enable manual `generate` runs through `workflow_dispatch`.
-
-Validate:
-
-- generated workflow commands
-- generated Compose paths
-- generated Terraform ports and ingress rules
-- generated README summary
-
-### Phase 3
-
-Adopt `generate-and-commit` only after the generated outputs are trusted for the target repositories.
-
-## Review Checklist
-
-- confirm the detected frontend path is correct
-- confirm the detected backend path is correct
-- review any workflow findings before trusting automation
-- treat generated Terraform as a baseline, not production-ready IaC
-- verify ports and deployment assumptions against the actual application
+- The AI output is grounded in the local scan, so detection quality still matters.
+- Generated files are starting points, not production-ready final assets.
+- Repositories with unusual layouts may still need manual interpretation.

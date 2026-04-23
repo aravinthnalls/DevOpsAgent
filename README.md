@@ -1,112 +1,82 @@
 # AI DevOps Agent
 
-`ai_devops_agent.py` scans a repository, identifies the likely frontend and backend stacks, reviews IaC and GitHub Actions, and produces analysis or starter delivery assets.
-
-No OpenAI token is required. The current implementation runs locally with standard Python.
+`ai_devops_agent.py` now runs in a single AI-driven mode. It scans a repository, builds a structured repo summary, sends that summary to OpenAI for richer DevOps analysis, and then writes a report plus starter delivery assets.
 
 ## What It Does
 
-- Scans the full repository instead of assuming only `frontend/` and `backend/`
-- Detects likely frontend language/framework and backend language/framework
-- Reviews existing Terraform, Kubernetes-style YAML, Helm, Docker, and GitHub Actions
-- Produces best-practice suggestions based on the detected application shape
-- Generates starter `pipeline.yml`, `docker-compose.yml`, `terraform/`, and `README_GENERATED.md`
+- Detects likely frontend and backend stacks across the full repo
+- Reviews Docker, IaC, and GitHub Actions
+- Uses OpenAI to generate richer architecture, workflow, security, and IaC guidance
+- Writes `AI_DEVOPS_REPORT.md`
+- Generates starter `.github/workflows/pipeline.yml`, `docker-compose.yml`, `terraform/`, and `README_GENERATED.md`
 
-## Architecture
+## Requirements
 
-```text
-ProjectAnalyzer          WorkflowOrchestrator          PipelineGenerator
-    ↓                           ↓                             ↓
-Repo-wide scanning       analyze-only mode            GitHub Actions workflow
-Frontend/backend ID      suggest-changes mode         Docker Compose config
-IaC + workflow review    generate-and-commit mode     Terraform infrastructure
-Security checks          generate mode                Generated documentation
-```
+- Python 3.9+
+- `OPENAI_API_TOKEN`
 
-## Quick Start
+Install dependencies:
 
 ```bash
-python ai_devops_agent.py --mode analyze-only
-python ai_devops_agent.py --mode suggest-changes
-python ai_devops_agent.py --mode generate
+python -m pip install -r requirements.txt
 ```
 
-## Detection Coverage
+## Usage
 
-The analyzer currently looks for:
+There is one supported mode:
 
-- Frontend stacks such as React, Next.js, Vue, Angular, Svelte, and static web apps
-- Backend stacks such as Python services, Node/Nest/Express services, Java services, and Go services
-- Existing IaC including Terraform, Kubernetes-like manifests, Helm charts, Docker Compose, and Dockerfiles
-- GitHub Actions workflow quality issues such as unsupported agent flags, stale artifact names, and missing test steps
+```bash
+python ai_devops_agent.py --mode ai
+```
+
+Optional flags:
+
+```bash
+python ai_devops_agent.py --project-root /path/to/repo --mode ai
+python ai_devops_agent.py --openai-model gpt-5.4-mini --mode ai
+```
+
+If `--openai-token` is not passed, the agent reads `OPENAI_API_TOKEN`.
 
 ## Output Files
 
-Depending on mode, the agent can create:
-
+- `AI_DEVOPS_REPORT.md`
 - `.github/workflows/pipeline.yml`
 - `docker-compose.yml`
 - `terraform/main.tf`
 - `terraform/variables.tf`
 - `README_GENERATED.md`
-- `SUGGESTIONS.md`
 
-## Modes
+## AI Usage
 
-| Mode | Purpose |
-|---|---|
-| `analyze-only` | Print repo analysis only |
-| `suggest-changes` | Write `SUGGESTIONS.md` with findings and recommendations |
-| `generate` | Generate starter delivery files |
-| `generate-and-commit` | Generate files and commit them if git is available |
+The agent uses a real OpenAI API call to enrich the heuristic repo scan with:
 
-Backward-compatible flags still work:
+- executive summary
+- architecture assessment
+- frontend and backend assessments
+- IaC recommendations
+- workflow review notes
+- security priorities
+- quick wins and longer-term improvements
 
-```bash
-python ai_devops_agent.py --analyze-only
-python ai_devops_agent.py --suggest-changes
-python ai_devops_agent.py --auto-commit
-```
+The default model is `gpt-5.4-mini`, configurable with `--openai-model`.
 
-## Configuration
-
-Optional `pipeline_request.txt` example:
-
-```yaml
-pipeline_name: my-service-pipeline
-environment: production
-target: aws_ec2
-instance_type: t3.micro
-frontend_port: 3000
-backend_port: 8000
-```
-
-## GitHub Actions Integration
+## GitHub Actions
 
 Use the template at [templates/github-actions/ai-devops-agent-template.yml](templates/github-actions/ai-devops-agent-template.yml).
 
-Important current expectations:
+The workflow should:
 
-- Use supported modes only: `analyze-only`, `suggest-changes`, `generate`, `generate-and-commit`
-- Expect the suggestions artifact to be `SUGGESTIONS.md`
-- Prefer pinning the agent source repo to a tag or commit SHA rather than `main`
-
-## Requirements
-
-- Python 3.9+
-
-Optional dev tools:
-
-- `pytest`
-- `ruff`
-- `mypy`
+- provide `OPENAI_API_TOKEN`
+- run `python ai_devops_agent.py --mode ai`
+- upload `AI_DEVOPS_REPORT.md`
 
 ## Notes
 
-- Generated Terraform is a starting point and should be reviewed before apply.
-- Generated workflows are starter pipelines and should be adapted to the target repository.
-- Detection is heuristic-based, so unusual repository layouts may need manual review.
+- Detection is still heuristic; AI enriches the findings but does not replace repository-specific review.
+- Generated Terraform and workflows are starting points and should be reviewed before production use.
+- Server-rendered HTML apps are treated as frontend surfaces even when they live inside the backend codebase.
 
 ## Support
 
-Implementation details and rollout guidance live in [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md).
+Implementation details live in [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md).

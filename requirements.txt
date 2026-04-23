@@ -1,1 +1,2 @@
-# No runtime dependencies are required for the simplified agent.
+requests>=2.31,<3.0
+PyYAML>=6.0,<7.0
