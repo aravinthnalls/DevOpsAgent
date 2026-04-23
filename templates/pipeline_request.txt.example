@@ -1,10 +1,12 @@
 # Optional. If omitted, the agent uses built-in defaults.
 pipeline_name: example-service-ai-pipeline
 target: aws_ec2
+app_image_repository: ghcr.io/example-org/example-app
 
 # Optional overrides
 environment: production
 instance_type: t3.micro
+app_image_tag: latest
 
 # Optional when the app supports multiple databases.
 # Supported examples: mysql, postgres

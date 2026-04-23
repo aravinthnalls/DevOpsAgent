@@ -75,12 +75,15 @@ If present, the generator currently uses these keys:
 - `environment`
 - `instance_type`
 - `database_engine`
+- `app_image_repository`
+- `app_image_tag`
 
 Minimal example:
 
 ```txt
 pipeline_name: example-service-ai-pipeline
 target: aws_ec2
+app_image_repository: ghcr.io/example-org/example-app
 ```
 
 Sensible defaults are used when the file is missing:
@@ -98,6 +101,8 @@ target: aws_ec2
 environment: production
 instance_type: t3.micro
 database_engine: postgres
+app_image_repository: ghcr.io/example-org/example-app
+app_image_tag: latest
 ```
 
 ## Outputs

@@ -1201,6 +1201,9 @@ class PipelineGenerator:
             "instance_type": "t3.micro",
             "frontend_port": "3000",
             "backend_port": "8000",
+            "database_engine": "",
+            "app_image_repository": "ghcr.io/example-org/example-app",
+            "app_image_tag": "latest",
         }
 
     def generate(self, analysis: Optional[Dict] = None, ai_insights: Optional[Dict] = None) -> bool:
@@ -1307,8 +1310,26 @@ class PipelineGenerator:
 
         docker_step = ""
         if (self.project_root / "Dockerfile").exists():
-            docker_step = """      - name: Build Docker image
-        run: docker build -t app:latest .
+            docker_step = """      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker build -t "$IMAGE_REPOSITORY:$IMAGE_TAG" .
+
+      - name: Push Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker push "$IMAGE_REPOSITORY:$IMAGE_TAG"
 """
 
         deploy_env = ""
@@ -1335,6 +1356,9 @@ class PipelineGenerator:
             deploy_steps = """      - name: Terraform apply
         if: env.CLOUD_DEPLOY_ENABLED == 'true'
         working-directory: terraform
+        env:
+          TF_VAR_app_image_repository: ghcr.io/${{ github.repository }}
+          TF_VAR_app_image_tag: ${{ github.sha }}
         run: |
           terraform init
           terraform validate
@@ -1397,10 +1421,17 @@ jobs:
             return "npm run build"
         return "echo 'No frontend build script found'"
 
+    def _selected_database_engine(self, backend: Dict) -> str:
+        datastores = backend.get("datastores", [])
+        preferred = self.config.get("database_engine", "").strip().lower()
+        if preferred in datastores:
+            return preferred
+        return datastores[0] if datastores else ""
+
     def _generate_docker_compose(self, analysis: Dict) -> None:
         frontend = analysis["frontend"]
         backend = analysis["backend"]
-        datastores = backend.get("datastores", [])
+        database_engine = self._selected_database_engine(backend)
         compose: Dict[str, object] = {
             "version": "3.9",
             "services": {},
@@ -1417,9 +1448,6 @@ jobs:
 
         if backend.get("exists"):
             internal_port = backend.get("port", 8080 if backend.get("language") == "java" else 8000)
-            preferred_datastore = self.config.get("database_engine", "").strip().lower()
-            if preferred_datastore not in datastores:
-                preferred_datastore = datastores[0] if datastores else ""
             backend_service: Dict[str, object] = {
                 "build": f"./{backend['path']}",
                 "ports": [f"{internal_port}:{internal_port}"],
@@ -1437,21 +1465,19 @@ jobs:
                 },
             }
             depends_on: Dict[str, Dict[str, str]] = {}
-            if "mysql" in datastores:
+            if database_engine == "mysql":
                 depends_on["mysql"] = {"condition": "service_healthy"}
-            if "postgres" in datastores:
-                depends_on["postgres"] = {"condition": "service_healthy"}
-            if preferred_datastore == "mysql":
                 backend_service["environment"]["DB_HOST"] = "mysql"
                 backend_service["environment"]["DB_PORT"] = "3306"
-            elif preferred_datastore == "postgres":
+            elif database_engine == "postgres":
+                depends_on["postgres"] = {"condition": "service_healthy"}
                 backend_service["environment"]["DB_HOST"] = "postgres"
                 backend_service["environment"]["DB_PORT"] = "5432"
             if depends_on:
                 backend_service["depends_on"] = depends_on
             compose["services"]["backend"] = backend_service
 
-        if "mysql" in datastores:
+        if database_engine == "mysql":
             compose["services"]["mysql"] = {
                 "image": "mysql:8.4",
                 "restart": "unless-stopped",
@@ -1475,7 +1501,7 @@ jobs:
             }
             compose["volumes"]["mysql_data"] = {}
 
-        if "postgres" in datastores:
+        if database_engine == "postgres":
             compose["services"]["postgres"] = {
                 "image": "postgres:16",
                 "restart": "unless-stopped",
@@ -1498,7 +1524,7 @@ jobs:
             }
             compose["volumes"]["postgres_data"] = {}
 
-        self._generate_container_init_scripts(datastores)
+        self._generate_container_init_scripts([database_engine] if database_engine else [])
         compose_file = self.project_root / "docker-compose.yml"
         if yaml is not None:
             compose_file.write_text(
@@ -1570,6 +1596,9 @@ jobs:
         tf_dir = self.project_root / "terraform"
         tf_dir.mkdir(parents=True, exist_ok=True)
         app_port = backend.get("port", frontend.get("port", 8080))
+        database_engine = self._selected_database_engine(backend)
+        app_image_repository = self.config.get("app_image_repository", "ghcr.io/example-org/example-app")
+        app_image_tag = self.config.get("app_image_tag", "latest")
 
         ingress_blocks = [
             """  ingress {
@@ -1651,8 +1680,14 @@ resource "aws_instance" "{resource_name}" {{
   instance_type          = var.instance_type
   vpc_security_group_ids = [aws_security_group.app.id]
   user_data              = templatefile("${{path.module}}/user_data.sh", {{
-    app_name = local.app_name
-    app_port = var.app_port
+    app_name             = local.app_name
+    app_port             = var.app_port
+    app_image_repository = var.app_image_repository
+    app_image_tag        = var.app_image_tag
+    database_engine      = var.database_engine
+    db_name              = var.db_name
+    db_user              = var.db_user
+    db_password          = var.db_password
   }})
 
   tags = {{
@@ -1685,6 +1720,37 @@ variable "application_ingress_cidr" {{
   type    = string
   default = "10.0.0.0/16"
 }}
+
+variable "app_image_repository" {{
+  type    = string
+  default = "{app_image_repository}"
+}}
+
+variable "app_image_tag" {{
+  type    = string
+  default = "{app_image_tag}"
+}}
+
+variable "database_engine" {{
+  type    = string
+  default = "{database_engine}"
+}}
+
+variable "db_name" {{
+  type    = string
+  default = "appdb"
+}}
+
+variable "db_user" {{
+  type    = string
+  default = "appuser"
+}}
+
+variable "db_password" {{
+  type      = string
+  default   = "change-me"
+  sensitive = true
+}}
 """
         outputs_tf = f"""output "instance_ip" {{
   value       = aws_instance.{resource_name}.public_ip
@@ -1700,26 +1766,124 @@ output "security_group_id" {{
   value       = aws_security_group.app.id
   description = "Security group attached to the application host"
 }}
+
+output "application_url" {{
+  value       = "http://${{aws_instance.{resource_name}.public_ip}}:${{var.app_port}}"
+  description = "Application URL"
+}}
 """
         tfvars_example = f"""aws_region = "us-east-1"
 instance_type = "{self.config.get('instance_type', 't3.micro')}"
 environment = "{self.config.get('environment', 'production')}"
 app_port = {app_port}
 application_ingress_cidr = "10.0.0.0/16"
+app_image_repository = "{app_image_repository}"
+app_image_tag = "{app_image_tag}"
+database_engine = "{database_engine}"
+db_name = "appdb"
+db_user = "appuser"
+db_password = "change-me"
 """
-        user_data = """#!/bin/bash
+        database_service_block = ""
+        depends_on_block = ""
+        backend_db_env = ""
+        volumes_block = ""
+        if database_engine == "mysql":
+            database_service_block = """  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${db_name}
+      MYSQL_USER: ${db_user}
+      MYSQL_PASSWORD: ${db_password}
+      MYSQL_ROOT_PASSWORD: ${db_password}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+"""
+            depends_on_block = """    depends_on:
+      mysql:
+        condition: service_healthy
+"""
+            backend_db_env = """      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: ${db_name}
+      DB_USER: ${db_user}
+      DB_PASSWORD: ${db_password}
+"""
+            volumes_block = """volumes:
+  mysql_data:
+"""
+        elif database_engine == "postgres":
+            database_service_block = """  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${db_name}
+      POSTGRES_USER: ${db_user}
+      POSTGRES_PASSWORD: ${db_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+"""
+            depends_on_block = """    depends_on:
+      postgres:
+        condition: service_healthy
+"""
+            backend_db_env = """      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${db_name}
+      DB_USER: ${db_user}
+      DB_PASSWORD: ${db_password}
+"""
+            volumes_block = """volumes:
+  postgres_data:
+"""
+        compose_content = f"""services:
+  app:
+    image: ${{app_image_repository}}:${{app_image_tag}}
+    restart: unless-stopped
+    ports:
+      - "${{app_port}}:${{app_port}}"
+    environment:
+      APP_PORT: "${{app_port}}"
+{backend_db_env}{depends_on_block}    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${{app_port}}/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+{database_service_block}{volumes_block}"""
+        user_data = f"""#!/bin/bash
 set -euxo pipefail
 
 apt-get update
-apt-get install -y docker.io docker-compose-plugin
+apt-get install -y docker.io docker-compose-plugin curl
 systemctl enable docker
 systemctl start docker
 
-mkdir -p /opt/${app_name}
+mkdir -p /opt/${{app_name}}
+cat >/opt/${{app_name}}/docker-compose.yml <<'COMPOSE'
+{compose_content}
+COMPOSE
+
+cd /opt/${{app_name}}
+docker compose pull || true
+docker compose up -d
+
 cat >/etc/motd <<EOM
-${app_name} bootstrap complete.
-Application port: ${app_port}
-Deploy your compose bundle or container image into /opt/${app_name}.
+${{app_name}} bootstrap complete.
+Application port: ${{app_port}}
+Image: ${{app_image_repository}}:${{app_image_tag}}
+Compose bundle: /opt/${{app_name}}/docker-compose.yml
 EOM
 """
         (tf_dir / "main.tf").write_text(main_tf, encoding="utf-8")
