@@ -1,81 +1,107 @@
 # AI DevOps Agent Implementation Guide
 
-**Simplified Version** — All workflow logic is now in Python!
+This guide reflects the current simplified agent behavior.
 
-This guide explains how to use the streamlined agent. The implementation is straightforward: a Python script with workflow orchestration modes instead of complex GitHub Actions templates.
+## Overview
 
-## Architecture Overview
+The agent is a single Python entrypoint with three main responsibilities:
 
-The agent is organized into clear, focused Python components:
+- `ProjectAnalyzer`: scan the full repository, identify likely application components, inspect IaC, inspect workflows, and flag risks
+- `PipelineGenerator`: generate starter workflow, Compose, Terraform, and generated documentation
+- `WorkflowOrchestrator`: expose the execution modes and write the final reports
 
-- **ProjectAnalyzer** - Analyzes project structure, frameworks, and security
-- **PipelineGenerator** - Generates CI/CD files and infrastructure code  
-- **WorkflowOrchestrator** - Manages execution modes (analyze, generate, suggest, etc.)
+## Repository Scanning Model
 
-All workflow logic runs in Python - no complex GitHub Actions orchestration needed.
+The analyzer no longer depends on a strict `frontend/` and `backend/` layout.
 
-## Target repository expectations
+It searches the repository for signals such as:
 
-Best results come from repositories with:
+- `package.json`, `index.html`, JS/TS source files for frontend detection
+- `requirements.txt`, `pyproject.toml`, Python source, `go.mod`, `pom.xml`, `build.gradle`, Node server packages for backend detection
+- Terraform files, Kubernetes-style YAML, Helm charts, Dockerfiles, Docker Compose, and `.github/workflows/*.yml`
 
-- `frontend/` for frontend application code (Node.js, React, Vue, etc.)
-- `backend/` for Python backend code (FastAPI, Flask, Django, etc.)  
-- `pipeline_request.txt` for generation settings (optional)
-
-## Installation
-
-Copy `ai_devops_agent.py` to your repository or reference it from this source repository.
-
-### Requirements
-
-```bash
-python -m pip install -r requirements.txt
-# Optional: install development tooling
-python -m pip install -r requirements-dev.txt
-python >= 3.9
-```
-
-## Usage
-
-## Required secrets in the target repository
-
-| Secret | Purpose | Required |
-|---|---|---|
-| `OPENAI_API_TOKEN` | AI enrichment (future use) | Optional |
+The output is heuristic. Repositories with unusual layouts can still be analyzed, but the results should be reviewed manually.
 
 ## Execution Modes
 
-The agent supports multiple execution modes:
+### Analyze Only
 
-### 1. Analyze Only
-Scan the project and display findings:
 ```bash
 python ai_devops_agent.py --mode analyze-only
 ```
 
-### 2. Generate Pipeline (Default)
-Generate all CI/CD and infrastructure files:
-```bash
-python ai_devops_agent.py
-# or
-python ai_devops_agent.py --mode generate
-```
+Prints a repo summary including:
 
-### 3. Generate and Commit
-Generate files and automatically commit:
-```bash
-python ai_devops_agent.py --mode generate-and-commit
-```
+- files scanned
+- top languages
+- frontend/backend detection
+- IaC/workflow counts
+- security summary
+- GitHub Actions drift findings
 
-### 4. Suggest Changes
-Create a suggestions report:
+### Suggest Changes
+
 ```bash
 python ai_devops_agent.py --mode suggest-changes
 ```
 
+Writes `SUGGESTIONS.md` containing:
+
+- repo summary
+- frontend/backend findings
+- IaC review
+- GitHub Actions review
+- security findings
+- best-practice strengths, gaps, and actions
+
+### Generate
+
+```bash
+python ai_devops_agent.py --mode generate
+```
+
+Generates starter assets:
+
+- `.github/workflows/pipeline.yml`
+- `docker-compose.yml`
+- `terraform/main.tf`
+- `terraform/variables.tf`
+- `README_GENERATED.md`
+
+### Generate And Commit
+
+```bash
+python ai_devops_agent.py --mode generate-and-commit
+```
+
+Runs generation, then attempts a git commit.
+
+## Workflow Template Expectations
+
+The template in `templates/github-actions/ai-devops-agent-template.yml` is the source of truth for workflow integration.
+
+The workflow should:
+
+- install Python and agent dependencies if needed
+- run `--mode analyze-only` for PR analysis
+- run `--mode suggest-changes` to produce `SUGGESTIONS.md`
+- use only supported modes in `workflow_dispatch`
+- avoid calling unsupported flags like `--apply-fixes`
+
+## Known Drift That Was Corrected
+
+Older workflow and documentation examples in downstream repos used stale behavior:
+
+- `generate-pipeline` instead of `generate`
+- `--apply-fixes`, which is not supported
+- `suggestions.md` instead of `SUGGESTIONS.md`
+- references to generated files that this simplified agent does not create
+
+If a target repository still uses those older names, update it to the current template.
+
 ## Configuration
 
-Create `pipeline_request.txt` in your project root:
+Optional `pipeline_request.txt`:
 
 ```yaml
 pipeline_name: my-service-pipeline
@@ -86,150 +112,38 @@ frontend_port: 3000
 backend_port: 8000
 ```
 
-## What Gets Generated
+## Rollout Guidance
 
-The agent creates:
+### Phase 1
 
-1. **`.github/workflows/pipeline.yml`** - Ready-to-use CI/CD pipeline
-   - Installs dependencies
-   - Runs tests  
-   - Builds Docker image
-   - Deploys to AWS
-
-2. **`docker-compose.yml`** - Local development environment
-   - Spins up frontend + backend services
-   - Configures networking and ports
-
-3. **`terraform/`** - Infrastructure as Code
-   - AWS EC2 instance configuration
-   - Security groups
-   - Auto-detection of Ubuntu AMI
-
-4. **`README_GENERATED.md`** - Documentation
-   - Project overview
-   - Quick start instructions
-   - Security findings
-   - Deployment steps
-
-## Workflow Benefits
-
-✅ **Simple** - Single Python file, no complex orchestration
-✅ **Fast** - Generates complete pipelines in seconds
-✅ **Modular** - Easy to extend or customize
-✅ **Type-safe** - Python type hints throughout
-✅ **Flexible** - Run locally or in any CI/CD system
-
-## Integration Examples
-
-### Run locally
-```bash
-python ai_devops_agent.py --project-root /path/to/project
-```
-
-### Use in GitHub Actions
-```yaml
-- name: Run AI DevOps Agent
-  run: python ai_devops_agent.py --mode generate-and-commit
-```
-
-### Use in GitLab CI
-```yaml
-ai_devops_agent:
-  script:
-    - pip install -q pyyaml requests
-    - python ai_devops_agent.py --mode suggest-changes
-```
-- runs `python ai_devops_agent.py --analyze-only`
-- runs `python ai_devops_agent.py --suggest-changes`
-- uploads artifacts
-- posts `suggestions.md` back to the pull request
-
-### Post-merge path
-
-When a pull request is merged, the workflow:
-
-- checks out `main`
-- checks out this repository into `.github/tools/devops-agent-source`
-- runs full generation
-- runs `--suggest-changes`
-- runs `--apply-fixes`
-- checks for changes
-- creates a new branch
-- opens an "AI Suggestions" pull request
-
-## Recommended rollout sequence
-
-### Phase 1: Analysis only
-
-Start with pull requests only.
+Run `analyze-only` and `suggest-changes` in pull requests.
 
 Validate:
 
-- repository detection
-- quality of `suggestions.md`
-- accuracy of AI-enriched security findings
+- frontend/backend detection quality
+- workflow findings
+- IaC findings
+- usefulness of best-practice suggestions
 
-### Phase 2: Controlled generation
+### Phase 2
 
-Enable the merge-triggered fix PR flow only after review.
+Enable manual `generate` runs through `workflow_dispatch`.
 
 Validate:
 
-- generated workflow files
-- Terraform outputs
-- Dockerfiles
-- README updates
+- generated workflow commands
+- generated Compose paths
+- generated Terraform ports and ingress rules
+- generated README summary
 
-### Phase 3: Production hardening
+### Phase 3
 
-After adoption:
+Adopt `generate-and-commit` only after the generated outputs are trusted for the target repositories.
 
-- refine `pipeline_request.txt`
-- narrow security group ingress rules
-- review generated Terraform before apply
-- adjust generated CI/CD for environment-specific needs
+## Review Checklist
 
-## OpenAI calls executed by the agent
-
-Per normal full run, the agent makes three model calls:
-
-1. security enrichment
-2. best-practices enrichment
-3. pipeline and infrastructure recommendations
-
-Outputs include CVE context, exploit scenarios, priority fixes, maturity level, quick wins, testing strategy, deployment recommendations, infrastructure optimisations, and performance tips.
-
-## What to review before merge
-
-Review these outputs carefully:
-
-- `.github/workflows/ci-cd.yml`
-- `.github/workflows/ai-generate-workflow.yml`
-- `terraform/main.tf`
-- `terraform/variables.tf`
-- `terraform/outputs.tf`
-- `terraform/terraform.tfvars`
-- `terraform/user_data.sh`
-- `frontend/Dockerfile`
-- `backend/Dockerfile`
-- `suggestions.md`
-- `README.md`
-
-## Operational cautions
-
-- Pin the source repository to a release tag or commit SHA instead of `main`.
-- Do not allow direct generation pushes to protected branches.
-- Treat generated Terraform as a starting point, not final production IaC.
-- Review Dockerfile fixes before deployment.
-- Review README output because current generation text can be project-specific.
-
-## Quick checklist
-
-- [ ] add `OPENAI_API_TOKEN`
-- [ ] add `PAT_TOKEN`
-- [ ] add AWS credentials if generated deployment workflows will be used
-- [ ] copy workflow into `.github/workflows/`
-- [ ] copy `pipeline_request.txt`
-- [ ] validate PR analysis output
-- [ ] validate post-merge fix PR creation
-- [ ] review generated infrastructure before applying changes
+- confirm the detected frontend path is correct
+- confirm the detected backend path is correct
+- review any workflow findings before trusting automation
+- treat generated Terraform as a baseline, not production-ready IaC
+- verify ports and deployment assumptions against the actual application

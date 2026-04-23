@@ -1,153 +1,79 @@
-# AI DevOps Agent (Simplified)
+# AI DevOps Agent
 
-`ai_devops_agent.py` is a straightforward DevOps automation tool that analyzes your codebase and generates production-ready CI/CD pipelines and infrastructure code.
+`ai_devops_agent.py` scans a repository, identifies the likely frontend and backend stacks, reviews IaC and GitHub Actions, and produces analysis or starter delivery assets.
 
-**No OpenAI token required** — The agent works standalone. Optional AI enrichment available via `--openai-token`.
+No OpenAI token is required. The current implementation runs locally with standard Python.
 
-## What this repository contains
+## What It Does
 
-- [ai_devops_agent.py](ai_devops_agent.py) — Single-file DevOps agent with Python workflow orchestration
-- [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md) — Usage guide and examples
-- [templates/](templates/) — Example configurations
+- Scans the full repository instead of assuming only `frontend/` and `backend/`
+- Detects likely frontend language/framework and backend language/framework
+- Reviews existing Terraform, Kubernetes-style YAML, Helm, Docker, and GitHub Actions
+- Produces best-practice suggestions based on the detected application shape
+- Generates starter `pipeline.yml`, `docker-compose.yml`, `terraform/`, and `README_GENERATED.md`
 
 ## Architecture
 
-```
+```text
 ProjectAnalyzer          WorkflowOrchestrator          PipelineGenerator
     ↓                           ↓                             ↓
-Frontend detection    analyze-only mode            GitHub Actions workflow
-Backend detection     generate mode                Docker Compose config
-Security scanning     suggest-changes mode        Terraform infrastructure
-Git analysis          generate-and-commit mode    Documentation
+Repo-wide scanning       analyze-only mode            GitHub Actions workflow
+Frontend/backend ID      suggest-changes mode         Docker Compose config
+IaC + workflow review    generate-and-commit mode     Terraform infrastructure
+Security checks          generate mode                Generated documentation
 ```
-
-All components run in Python — no complex YAML orchestration needed!
 
 ## Quick Start
 
 ```bash
-# Install dependencies
-python -m pip install -r requirements.txt
-
-# Analyze your project
 python ai_devops_agent.py --mode analyze-only
-
-# Generate CI/CD pipeline
-python ai_devops_agent.py --mode generate
-
-# Generate and commit changes
-python ai_devops_agent.py --mode generate-and-commit
-
-# Get suggestions report
 python ai_devops_agent.py --mode suggest-changes
+python ai_devops_agent.py --mode generate
 ```
 
-## What the agent generates
+## Detection Coverage
 
-✅ **CI/CD Pipeline** - `.github/workflows/pipeline.yml`
-- Dependency installation
-- Test execution
-- Docker image building
-- AWS deployment
+The analyzer currently looks for:
 
-✅ **Infrastructure as Code** - `terraform/`
-- AWS EC2 instance configuration
-- Security groups
-- Output variables
+- Frontend stacks such as React, Next.js, Vue, Angular, Svelte, and static web apps
+- Backend stacks such as Python services, Node/Nest/Express services, Java services, and Go services
+- Existing IaC including Terraform, Kubernetes-like manifests, Helm charts, Docker Compose, and Dockerfiles
+- GitHub Actions workflow quality issues such as unsupported agent flags, stale artifact names, and missing test steps
 
-✅ **Container Configuration** - `docker-compose.yml`
-- Frontend service
-- Backend service
-- Networking setup
+## Output Files
 
-✅ **Documentation** - `README_GENERATED.md`
-- Project overview
-- Security findings
-- Deployment instructions
+Depending on mode, the agent can create:
 
-## Project Detection
+- `.github/workflows/pipeline.yml`
+- `docker-compose.yml`
+- `terraform/main.tf`
+- `terraform/variables.tf`
+- `README_GENERATED.md`
+- `SUGGESTIONS.md`
 
-The agent automatically detects:
+## Modes
 
-- **Frontend**: React, Vue, Angular, Next.js, or vanilla HTML/CSS/JS
-- **Backend**: FastAPI, Flask, Django, or generic Python
-- **Services**: Port numbers, dependencies, frameworks
-- **Infrastructure**: Existing Terraform, Docker, git repositories
-- **Security Issues**: Common vulnerabilities in code and configuration
+| Mode | Purpose |
+|---|---|
+| `analyze-only` | Print repo analysis only |
+| `suggest-changes` | Write `SUGGESTIONS.md` with findings and recommendations |
+| `generate` | Generate starter delivery files |
+| `generate-and-commit` | Generate files and commit them if git is available |
 
-## Workflow Modes
-
-The agent runs in different modes depending on your use case:
-
-| Mode | Purpose | Use Case |
-|---|---|---|
-| `analyze-only` | Scan and report without generating files | PR analysis, security review |
-| `generate` (default) | Generate complete pipeline | Initial setup, updates |
-| `generate-and-commit` | Generate and commit to git | CI/CD automation |
-| `suggest-changes` | Create suggestions markdown report | Documentation, reviews |
-
-## Installation & Setup
+Backward-compatible flags still work:
 
 ```bash
-# Clone this repository
-git clone <repo-url>
-
-# Install dependencies
-python -m pip install -r requirements.txt
-
-# Optional: install dev tools (pytest, ruff, mypy)
-python -m pip install -r requirements-dev.txt
-
-# Copy agent to your project or reference it
-cp ai_devops_agent.py /path/to/your/project/
-
-# Add pipeline config (optional)
-cp templates/pipeline_request.txt.example pipeline_request.txt
+python ai_devops_agent.py --analyze-only
+python ai_devops_agent.py --suggest-changes
+python ai_devops_agent.py --auto-commit
 ```
 
-## Usage Examples
+## Configuration
 
-### Local Development
-
-```bash
-# Analyze your project
-python ai_devops_agent.py --project-root . --mode analyze-only
-
-# Generate pipeline
-python ai_devops_agent.py --project-root . --mode generate
-```
-
-### CI/CD Integration
-
-**GitHub Actions:**
-```yaml
-- name: Generate DevOps Pipeline
-  run: |
-    python -m pip install -r requirements.txt
-    python ai_devops_agent.py --mode generate-and-commit
-```
-
-**GitLab CI:**
-```yaml
-generate_pipeline:
-  script:
-    - python -m pip install -r requirements.txt
-    - python ai_devops_agent.py --mode generate
-```
-
-### Docker
-
-```bash
-docker run -v $(pwd):/app python:3.11 bash -c \
-  "cd /app && python -m pip install -r requirements.txt && python ai_devops_agent.py"
-```
-
-## Configuration File
-
-Create `pipeline_request.txt` in your project root:
+Optional `pipeline_request.txt` example:
 
 ```yaml
-pipeline_name: my-awesome-app
+pipeline_name: my-service-pipeline
 environment: production
 target: aws_ec2
 instance_type: t3.micro
@@ -155,85 +81,32 @@ frontend_port: 3000
 backend_port: 8000
 ```
 
-All settings have sensible defaults, so the file is optional.
+## GitHub Actions Integration
 
-## Output Files
+Use the template at [templates/github-actions/ai-devops-agent-template.yml](templates/github-actions/ai-devops-agent-template.yml).
 
-After running, check these files:
+Important current expectations:
 
-```
-├── .github/workflows/pipeline.yml       ← GitHub Actions CI/CD
-├── docker-compose.yml                   ← Local development
-├── terraform/
-│   ├── main.tf                          ← EC2 resources
-│   └── variables.tf                     ← Configuration
-├── README_GENERATED.md                  ← Generated docs
-└── SUGGESTIONS.md                       ← (if using suggest-changes mode)
-```
+- Use supported modes only: `analyze-only`, `suggest-changes`, `generate`, `generate-and-commit`
+- Expect the suggestions artifact to be `SUGGESTIONS.md`
+- Prefer pinning the agent source repo to a tag or commit SHA rather than `main`
 
-## CLI Reference
-
-```bash
-# Show all options
-python ai_devops_agent.py --help
-
-# Analyze current directory
-python ai_devops_agent.py
-
-# Analyze specific project
-python ai_devops_agent.py --project-root /path/to/project
-
-# Use custom config file
-python ai_devops_agent.py --config-file custom-config.txt
-
-# Enable verbose output
-python ai_devops_agent.py --verbose
-
-# Use OpenAI token for future enhancements
-python ai_devops_agent.py --openai-token YOUR_TOKEN_HERE
-```
-
-## Project Requirements
-
-The agent works best with projects that have:
-
-```
-project/
-├── frontend/               (optional: Node.js or static HTML)
-│   ├── package.json
-│   └── src/
-├── backend/                (optional: Python)
-│   ├── requirements.txt
-│   └── main.py
-├── Dockerfile              (optional)
-├── docker-compose.yml      (optional)
-└── pipeline_request.txt    (optional)
-```
-
-If your project structure is different, the agent will still work but may need manual adjustments to generated files.
-
-## Dependencies
+## Requirements
 
 - Python 3.9+
-- `pyyaml`
-- `requests`
 
-## License
+Optional dev tools:
 
-MIT
+- `pytest`
+- `ruff`
+- `mypy`
 
-## Contributing
+## Notes
 
-Contributions welcome! Areas for improvement:
-
-- [ ] Support for more languages (Go, Node.js, Java)
-- [ ] Additional CI/CD platforms (GitLab CI, CircleCI, etc.)
-- [ ] More infrastructure targets (Kubernetes, GCP, Azure)
-- [ ] Enhanced security scanning
-- [ ] Cost optimization analysis
+- Generated Terraform is a starting point and should be reviewed before apply.
+- Generated workflows are starter pipelines and should be adapted to the target repository.
+- Detection is heuristic-based, so unusual repository layouts may need manual review.
 
 ## Support
 
-For issues or suggestions, open an issue in this repository.
-
-For rollout details, see [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md).
+Implementation details and rollout guidance live in [docs/IMPLEMENTATION_GUIDE.md](docs/IMPLEMENTATION_GUIDE.md).
